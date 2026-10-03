@@ -5,14 +5,28 @@ from typing import Any
 import httpx
 import pytest
 
-from x_search.client import XAPIAuthError, XAPIError, XClient, XRateLimitError
+from x_search.client import (
+    XAPIAuthError,
+    XAPIError,
+    XClient,
+    XCredentialsError,
+    XRateLimitError,
+    XValidationError,
+)
 
 
 def test_missing_credentials(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("X_BEARER_TOKEN", raising=False)
     monkeypatch.delenv("TWITTER_BEARER_TOKEN", raising=False)
-    with pytest.raises(ValueError, match="Bearer Token"):
+    with pytest.raises(XCredentialsError, match="Bearer Token"):
         XClient(bearer_token=None)
+
+
+def test_whitespace_only_credentials(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("X_BEARER_TOKEN", raising=False)
+    monkeypatch.delenv("TWITTER_BEARER_TOKEN", raising=False)
+    with pytest.raises(XCredentialsError, match="Bearer Token"):
+        XClient(bearer_token="   ")
 
 
 def test_credentials_from_env(monkeypatch: pytest.MonkeyPatch):
@@ -181,10 +195,69 @@ async def test_get_post_by_url(sample_single_post_json: dict[str, Any]):
         post2 = await client.get_post("https://twitter.com/user/status/1840000000000000001?s=20")
         assert post2.id == "1840000000000000001"
 
+        # Plural /statuses/ URL and markdown brackets
+        post3 = await client.get_post("<https://twitter.com/user/statuses/1840000000000000001>")
+        assert post3.id == "1840000000000000001"
+
 
 @pytest.mark.asyncio
 async def test_get_post_invalid_identifier():
     async with httpx.AsyncClient() as http_client:
         client = XClient(bearer_token="test_token", http_client=http_client)
-        with pytest.raises(ValueError, match="Invalid post ID or URL"):
+        with pytest.raises(XValidationError, match="Invalid post ID or URL"):
             await client.get_post("not_a_valid_id_or_url")
+
+
+@pytest.mark.asyncio
+async def test_search_recent_empty_query():
+    async with httpx.AsyncClient() as http_client:
+        client = XClient(bearer_token="test_token", http_client=http_client)
+        with pytest.raises(XValidationError, match="query cannot be empty"):
+            await client.search_recent(query="   ")
+
+
+@pytest.mark.asyncio
+async def test_search_recent_query_too_long():
+    async with httpx.AsyncClient() as http_client:
+        client = XClient(bearer_token="test_token", http_client=http_client)
+        long_query = "python " * 80  # > 512 chars
+        with pytest.raises(XValidationError, match="512 characters"):
+            await client.search_recent(query=long_query)
+
+
+@pytest.mark.asyncio
+async def test_search_recent_nullable_fields():
+    payload = {
+        "data": [
+            {
+                "id": "1840000000000000001",
+                "text": "Post with no author hydration",
+                "author_id": "999",
+            }
+        ],
+        "includes": {"users": None},
+        "meta": None,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = XClient(bearer_token="test_token", http_client=http_client)
+        res = await client.search_recent(query="test")
+        assert len(res.posts) == 1
+        assert res.posts[0].author is None
+        assert res.result_count == 1
+
+
+@pytest.mark.asyncio
+async def test_search_recent_network_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("Connection timed out")
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = XClient(bearer_token="test_token", http_client=http_client)
+        with pytest.raises(XAPIError, match="Network error"):
+            await client.search_recent(query="test")

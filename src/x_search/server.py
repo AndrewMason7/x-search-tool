@@ -1,9 +1,18 @@
+"""FastMCP server exposing tools for searching X (Twitter) and inspecting posts."""
+
 try:
     from mcp.server.mcpserver import MCPServer
 except ImportError:
     from mcp.server.fastmcp import FastMCP as MCPServer
 
-from x_search.client import XAPIAuthError, XAPIError, XClient, XRateLimitError
+from x_search.client import (
+    XAPIAuthError,
+    XAPIError,
+    XClient,
+    XCredentialsError,
+    XRateLimitError,
+    XValidationError,
+)
 from x_search.models import Post, SearchResponse
 
 mcp = MCPServer(
@@ -12,6 +21,14 @@ mcp = MCPServer(
 )
 
 _client_instance: XClient | None = None
+
+CREDENTIALS_HELP = (
+    "### Error: Missing X API Credentials\n\n"
+    "The X API Bearer Token is not configured.\n\n"
+    "**Setup instructions:**\n"
+    "1. Set `X_BEARER_TOKEN` (or `TWITTER_BEARER_TOKEN`) in your environment, or\n"
+    "2. Add `X_BEARER_TOKEN=your_token` to a `.env` file in the tool directory."
+)
 
 
 def get_client() -> XClient:
@@ -44,9 +61,11 @@ def format_post(post: Post) -> str:
             parts.append(f"👁️ {post.metrics.impression_count:,} views")
         metrics_str = " | ".join(parts)
 
+    quote_body = "\n".join(f"> {line}" for line in post.text.strip().splitlines())
+
     lines = [
         f"### {author_line}",
-        f"> {post.text.strip()}",
+        quote_body,
         "",
         f"- **Date:** {created}",
     ]
@@ -111,17 +130,25 @@ async def search_recent_posts(
             next_token=next_token,
         )
         return format_search_response(res)
-    except ValueError as e:
-        return (
-            "### Error: Missing X API Credentials\n\n"
-            f"{e}\n\n"
-            "To use X search, set the `X_BEARER_TOKEN` (or `TWITTER_BEARER_TOKEN`) "
-            "environment variable or add it to `.env` in the tool directory."
-        )
+    except XCredentialsError:
+        return CREDENTIALS_HELP
+    except XValidationError as e:
+        return f"### Invalid Input\n\n{e}"
     except XRateLimitError as e:
-        return f"### Rate Limit Exceeded\n\n{e}\nPlease wait until the rate limit window resets before querying again."
+        countdown = (
+            f"\n\n**Countdown to Reset:** ~{e.rate_limit.reset_seconds} seconds"
+            if e.rate_limit and e.rate_limit.reset_seconds is not None
+            else ""
+        )
+        return (
+            f"### Rate Limit Exceeded\n\n{e}{countdown}\n"
+            "Please wait until the rate limit window resets before querying again."
+        )
     except XAPIAuthError as e:
-        return f"### Authentication Failure\n\n{e}\nPlease verify that your X Bearer Token is valid and has search permissions."
+        return (
+            f"### Authentication Failure\n\n{e}\n"
+            "Please verify that your X Bearer Token is valid and has search permissions."
+        )
     except XAPIError as e:
         return f"### X API Error\n\n{e}"
     except Exception as e:  # noqa: BLE001
@@ -140,10 +167,17 @@ async def get_post(post_id_or_url: str) -> str:
         client = get_client()
         post = await client.get_post(post_id_or_url)
         return format_post(post)
-    except ValueError as e:
+    except XCredentialsError:
+        return CREDENTIALS_HELP
+    except XValidationError as e:
         return f"### Invalid Input\n\n{e}"
     except XRateLimitError as e:
-        return f"### Rate Limit Exceeded\n\n{e}"
+        countdown = (
+            f"\n\n**Countdown to Reset:** ~{e.rate_limit.reset_seconds} seconds"
+            if e.rate_limit and e.rate_limit.reset_seconds is not None
+            else ""
+        )
+        return f"### Rate Limit Exceeded\n\n{e}{countdown}"
     except XAPIAuthError as e:
         return f"### Authentication Failure\n\n{e}"
     except XAPIError as e:
@@ -174,5 +208,7 @@ async def check_rate_limits() -> str:
             f"- **Resets At:** {reset_str}\n"
             f"- **Countdown:** ~{status.reset_seconds} seconds\n"
         )
+    except XCredentialsError:
+        return CREDENTIALS_HELP
     except Exception as e:  # noqa: BLE001
         return f"### Unable to check rate limits\n\n{e}"

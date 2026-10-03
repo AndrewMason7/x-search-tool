@@ -2,7 +2,6 @@
 
 import os
 import re
-import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -18,8 +17,16 @@ class XSearchError(Exception):
     """Base exception for X search errors."""
 
 
+class XCredentialsError(XSearchError):
+    """Authentication credentials missing or invalid in configuration."""
+
+
+class XValidationError(XSearchError):
+    """Input query or argument validation failed."""
+
+
 class XAPIError(XSearchError):
-    """General X API error."""
+    """General X API error or network failure."""
 
 
 class XAPIAuthError(XSearchError):
@@ -29,13 +36,17 @@ class XAPIAuthError(XSearchError):
 class XRateLimitError(XSearchError):
     """Rate limit exceeded (HTTP 429)."""
 
+    def __init__(self, message: str, rate_limit: RateLimitStatus | None = None) -> None:
+        super().__init__(message)
+        self.rate_limit = rate_limit
+
 
 def extract_post_id(post_id_or_url: str) -> str:
     """Extract numeric post ID from a raw ID or an X/Twitter URL."""
-    cleaned = post_id_or_url.strip()
+    cleaned = post_id_or_url.strip().strip("<>\"'")
 
-    # Match URL pattern like https://x.com/user/status/1234567890
-    match = re.search(r"status/(\d+)", cleaned)
+    # Match URL pattern like https://x.com/user/status/1234567890 or /statuses/
+    match = re.search(r"status(?:es)?/(\d+)", cleaned)
     if match:
         return match.group(1)
 
@@ -43,7 +54,7 @@ def extract_post_id(post_id_or_url: str) -> str:
     if re.fullmatch(r"\d+", cleaned):
         return cleaned
 
-    raise ValueError(f"Invalid post ID or URL: {post_id_or_url}")
+    raise XValidationError(f"Invalid post ID or URL: {post_id_or_url}")
 
 
 class XClient:
@@ -56,9 +67,11 @@ class XClient:
         bearer_token: str | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
-        token = bearer_token or os.getenv("X_BEARER_TOKEN") or os.getenv("TWITTER_BEARER_TOKEN")
+        token = (
+            bearer_token or os.getenv("X_BEARER_TOKEN") or os.getenv("TWITTER_BEARER_TOKEN") or ""
+        ).strip()
         if not token:
-            raise ValueError(
+            raise XCredentialsError(
                 "X_BEARER_TOKEN or TWITTER_BEARER_TOKEN environment variable not set. "
                 "Please configure your X Bearer Token."
             )
@@ -82,17 +95,14 @@ class XClient:
         remaining_int = int(remaining) if remaining and remaining.isdigit() else None
 
         reset_at: datetime | None = None
-        reset_seconds: int | None = None
         if reset and reset.isdigit():
             reset_ts = int(reset)
             reset_at = datetime.fromtimestamp(reset_ts, UTC)
-            reset_seconds = max(0, int(reset_ts - time.time()))
 
         self._last_rate_limit = RateLimitStatus(
             limit=limit_int,
             remaining=remaining_int,
             reset_at=reset_at,
-            reset_seconds=reset_seconds,
         )
 
     def get_rate_limit_status(self) -> RateLimitStatus:
@@ -117,17 +127,22 @@ class XClient:
 
     def _parse_users(self, data: dict[str, Any]) -> dict[str, Author]:
         users_map: dict[str, Author] = {}
-        includes = data.get("includes", {})
-        if isinstance(includes, dict) and "users" in includes:
-            for u in includes["users"]:
-                if isinstance(u, dict) and "id" in u:
-                    users_map[str(u["id"])] = Author(
-                        id=str(u["id"]),
-                        username=u.get("username", ""),
-                        name=u.get("name", ""),
-                        verified=bool(u.get("verified", False)),
-                        profile_image_url=u.get("profile_image_url"),
-                    )
+        includes = data.get("includes")
+        if isinstance(includes, dict):
+            raw_users = includes.get("users")
+            if isinstance(raw_users, list):
+                for u in raw_users:
+                    if isinstance(u, dict) and "id" in u:
+                        verified = bool(u.get("verified", False)) or (
+                            bool(u.get("verified_type")) and u.get("verified_type") != "none"
+                        )
+                        users_map[str(u["id"])] = Author(
+                            id=str(u["id"]),
+                            username=u.get("username", ""),
+                            name=u.get("name", ""),
+                            verified=verified,
+                            profile_image_url=u.get("profile_image_url"),
+                        )
         return users_map
 
     def _parse_post(self, item: dict[str, Any], users_map: dict[str, Author]) -> Post:
@@ -165,15 +180,20 @@ class XClient:
         self, method: str, url: str, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         headers = self._get_headers()
-        if self._external_client:
-            res = await self._external_client.request(method, url, headers=headers, params=params)
-            self._update_rate_limit(res.headers)
-            return self._handle_response(res)
+        try:
+            if self._external_client:
+                res = await self._external_client.request(
+                    method, url, headers=headers, params=params
+                )
+                self._update_rate_limit(res.headers)
+                return self._handle_response(res)
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            res = await client.request(method, url, headers=headers, params=params)
-            self._update_rate_limit(res.headers)
-            return self._handle_response(res)
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                res = await client.request(method, url, headers=headers, params=params)
+                self._update_rate_limit(res.headers)
+                return self._handle_response(res)
+        except httpx.RequestError as e:
+            raise XAPIError(f"Network error communicating with X API: {e}") from e
 
     def _handle_response(self, res: httpx.Response) -> dict[str, Any]:
         if res.status_code == 200:
@@ -183,7 +203,10 @@ class XClient:
         if res.status_code in (401, 403):
             raise XAPIAuthError(f"Unauthorized ({res.status_code}): {error_msg}")
         if res.status_code == 429:
-            raise XRateLimitError(f"Rate limit exceeded (429): {error_msg}")
+            raise XRateLimitError(
+                f"Rate limit exceeded (429): {error_msg}",
+                rate_limit=self._last_rate_limit,
+            )
         raise XAPIError(f"X API Error ({res.status_code}): {error_msg}")
 
     async def search_recent(
@@ -194,30 +217,38 @@ class XClient:
         sort_order: str = "recency",
     ) -> SearchResponse:
         """Search recent posts (last 7 days) on X."""
+        clean_query = query.strip()
+        if not clean_query:
+            raise XValidationError("Search query cannot be empty.")
+        if len(clean_query) > 512:
+            raise XValidationError(
+                f"Search query exceeds X API limit of 512 characters (length: {len(clean_query)})."
+            )
+
         clamped_max = max(10, min(max_results, 100))
         params: dict[str, Any] = {
-            "query": query,
+            "query": clean_query,
             "max_results": clamped_max,
             "tweet.fields": "created_at,public_metrics,author_id,edit_history_tweet_ids",
             "expansions": "author_id",
             "user.fields": "username,name,verified,profile_image_url",
             "sort_order": sort_order,
         }
-        if next_token:
-            params["next_token"] = next_token
+        if next_token and next_token.strip():
+            params["next_token"] = next_token.strip()
 
         url = f"{self.BASE_URL}/tweets/search/recent"
         payload = await self._send_request("GET", url, params=params)
 
         users_map = self._parse_users(payload)
         posts: list[Post] = []
-        raw_posts = payload.get("data", [])
+        raw_posts = payload.get("data")
         if isinstance(raw_posts, list):
             for item in raw_posts:
                 if isinstance(item, dict) and "id" in item:
                     posts.append(self._parse_post(item, users_map))
 
-        meta = payload.get("meta", {})
+        meta = payload.get("meta") or {}
         return SearchResponse(
             posts=posts,
             result_count=meta.get("result_count", len(posts)),

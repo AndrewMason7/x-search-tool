@@ -53,10 +53,21 @@ class SearchResponse(BaseModel):
     next_token: str | None = None
 
 
+from datetime import UTC, datetime
+
+
 class RateLimitStatus(BaseModel):
     """Rate limit headers snapshot."""
 
     limit: int | None = None
     remaining: int | None = None
     reset_at: datetime | None = None
-    reset_seconds: int | None = None
+
+    @property
+    def reset_seconds(self) -> int | None:
+        """Dynamically computes the remaining seconds until reset."""
+        if not self.reset_at:
+            return None
+        now = datetime.now(UTC)
+        diff = (self.reset_at - now).total_seconds()
+        return max(0, int(diff))

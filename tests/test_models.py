@@ -67,10 +67,14 @@ def test_search_response_model():
     assert res.next_token == "token_abc"
 
 
+from datetime import timedelta
+
+
 def test_rate_limit_status():
-    now = datetime.now(UTC)
-    status = RateLimitStatus(limit=180, remaining=179, reset_at=now, reset_seconds=900)
+    future = datetime.now(UTC) + timedelta(seconds=900)
+    status = RateLimitStatus(limit=180, remaining=179, reset_at=future)
     assert status.limit == 180
     assert status.remaining == 179
-    assert status.reset_at == now
-    assert status.reset_seconds == 900
+    assert status.reset_at == future
+    assert status.reset_seconds is not None
+    assert 895 <= status.reset_seconds <= 900
