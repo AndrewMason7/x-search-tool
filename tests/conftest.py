@@ -10,7 +10,6 @@ import pytest
 from x_search.client import XClient
 
 
-# FIX #E1.1 (per Marcus): Hermetic test isolation resetting singleton client state between tests
 @pytest.fixture(autouse=True)
 def reset_server_singleton() -> Any:
     """Ensure x_search.server._client_instance is reset before and after each test."""
@@ -21,7 +20,6 @@ def reset_server_singleton() -> Any:
     server_mod._client_instance = None
 
 
-# FIX #E3.1 & #E5.1 (per Raj & Tom): High-performance client factory with zero-delay backoff
 @pytest.fixture
 def make_test_client() -> Callable[..., XClient]:
     """Factory fixture returning an XClient configured with zero-delay retries for fast testing."""
@@ -46,7 +44,6 @@ def make_test_client() -> Callable[..., XClient]:
     return _factory
 
 
-# FIX #H2.1 (per Jake): DRY mock server client fixture eliminating repetitive patch boilerplate
 @pytest.fixture
 def mock_server_client() -> AsyncGenerator[AsyncMock, None]:
     """Provides a mocked XClient pre-injected into x_search.server.get_client."""

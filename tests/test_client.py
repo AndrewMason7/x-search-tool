@@ -254,7 +254,6 @@ async def test_search_recent_nullable_fields():
         assert res.result_count == 1
 
 
-# FIX #E3.1 & #Tyler.1 (per Raj & Tyler): sub-millisecond backoff eliminates 1.3s sleep delay in test
 @pytest.mark.asyncio
 async def test_search_recent_network_error():
     def handler(request: httpx.Request) -> httpx.Response:
@@ -597,7 +596,6 @@ async def test_retry_after_on_transient_503(sample_single_post_json: dict[str, A
         assert post.id == "1840000000000000001"
 
 
-# FIX #E2.1 (per Natasha): Unicode, RTL, and emoji queries handling
 @pytest.mark.asyncio
 async def test_search_recent_unicode_and_emojis(sample_search_json: dict[str, Any]):
     captured_query = ""

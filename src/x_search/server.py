@@ -43,7 +43,6 @@ def get_client() -> XClient:
     return _client_instance
 
 
-# FIX #E5.1 & #E1.1 (per Tom & Marcus): Contextual MCP error boundary decorator with customizable auth help
 def mcp_error_boundary(
     func: Callable[..., Coroutine[Any, Any, str]] | None = None,
     *,
@@ -127,7 +126,6 @@ def format_post(post: Post) -> str:
     return "\n".join(lines)
 
 
-# FIX #E5.1 (per Tom): Semantic scope parameter eliminates claiming 2006 historical tweets are "recent"
 def format_search_response(res: SearchResponse, scope_label: str = "recent") -> str:
     """Format SearchResponse into a structured Markdown document."""
     label = f" {scope_label}" if scope_label else ""
@@ -223,7 +221,6 @@ async def get_post(post_id_or_url: str) -> str:
     return format_post(post)
 
 
-# FIX #E1.1 (per Marcus): Scope rate limits per endpoint category to prevent bucket collision
 @mcp.tool()
 @mcp_error_boundary
 async def check_rate_limits(endpoint: str = "search") -> str:

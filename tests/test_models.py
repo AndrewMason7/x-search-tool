@@ -117,7 +117,6 @@ def test_post_counts_models():
     assert resp.next_token == "token_count"
 
 
-# FIX #E4.1 (per Maya): Deterministic assertion testing on calculated reset_at boundaries
 def test_rate_limit_from_headers_retry_after_delta():
     headers = {"retry-after": "120"}
     before = datetime.now(UTC)

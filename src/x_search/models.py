@@ -77,13 +77,11 @@ class RateLimitStatus(BaseModel):
         """Dynamically computes the remaining seconds until reset safely."""
         if not self.reset_at:
             return None
-        # FIX #E4.3 (per Maya): Normalizes naive vs aware datetimes to UTC before subtraction
         reset_target = self.reset_at.astimezone(UTC)
         now = datetime.now(UTC)
         diff = (reset_target - now).total_seconds()
         return max(0, int(diff))
 
-    # FIX #E4.2 (per Maya): Helper to parse standard Retry-After header
     @classmethod
     def from_headers(cls, headers: Any) -> "RateLimitStatus":
         """Parse rate limit headers including x-rate-limit and standard Retry-After."""

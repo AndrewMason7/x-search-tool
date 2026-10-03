@@ -53,7 +53,6 @@ class XRateLimitError(XSearchError):
         self.rate_limit = rate_limit
 
 
-# FIX #E3.1 & #E2.2 (per Raj & Natasha): Pre-compiled regexes with length bounds & clean boundary isolation
 _POST_URL_PATTERN = re.compile(r"(?:^|/)status(?:es)?/(\d{1,30})(?:[/?#]|$)")
 _NUMERIC_ID_PATTERN = re.compile(r"^\d{1,30}$")
 _MAX_POST_INPUT_LEN = 512
@@ -67,11 +66,9 @@ def extract_post_id(post_id_or_url: str) -> str:
     if not cleaned or len(cleaned) > _MAX_POST_INPUT_LEN:
         raise XValidationError(f"Invalid post ID or URL: {post_id_or_url}")
 
-    # Match pure numeric string
     if _NUMERIC_ID_PATTERN.fullmatch(cleaned):
         return cleaned
 
-    # Match URL pattern with domain verification
     try:
         parsed = urlparse(cleaned if "://" in cleaned else f"https://{cleaned}")
         domain = (parsed.hostname or "").lower()
@@ -89,7 +86,6 @@ def extract_post_id(post_id_or_url: str) -> str:
     raise XValidationError(f"Invalid post ID or URL: {post_id_or_url}")
 
 
-# FIX #E2.1 (per Natasha): Strict RFC 3339 / ISO 8601 UTC timestamp validation helper
 def validate_iso_timestamp(param_name: str, ts_str: str) -> str:
     """Validate that timestamp string conforms to RFC 3339 / ISO 8601 with timezone."""
     cleaned = ts_str.strip()
@@ -145,20 +141,16 @@ class XClient:
         self._timeout = timeout
         self._max_retries = max_retries
         self._backoff_base = backoff_base
-        # FIX #E1.1 (per Marcus): Track rate limits per endpoint category
         self._rate_limits: dict[str, RateLimitStatus] = {}
 
-        # FIX #H4.1 (per Tyler): Pre-cached static base headers
         self._headers = {
             "Authorization": f"Bearer {self._bearer_token}",
             "User-Agent": "x-search-tool/0.2.0",
             "Accept": "application/json",
         }
 
-        # FIX #E4.1 & #H4.1 (per Maya & Tyler): Persistent connection pool & client reuse
         self._external_client = http_client
         self._internal_client: httpx.AsyncClient | None = None
-        # FIX #H1.1 (per Kyle): Event-loop-bound lock reference
         self._client_lock: asyncio.Lock | None = None
         self._lock_loop: asyncio.AbstractEventLoop | None = None
 
@@ -167,7 +159,6 @@ class XClient:
         """Returns the configured Bearer Token."""
         return self._bearer_token
 
-    # FIX #E2.1 (per Natasha): Redact bearer token in string & repr representations
     def __repr__(self) -> str:
         masked = (
             f"{self._bearer_token[:4]}...{self._bearer_token[-4:]}"
@@ -179,7 +170,6 @@ class XClient:
     def __str__(self) -> str:
         return self.__repr__()
 
-    # FIX #H1.1 (per Kyle): Event loop lock affinity checking
     def _get_lock(self) -> asyncio.Lock:
         try:
             curr_loop = asyncio.get_running_loop()
@@ -224,7 +214,6 @@ class XClient:
     def _get_headers(self) -> dict[str, str]:
         return self._headers
 
-    # FIX #E1.1 & #E4.2 (per Marcus & Maya): Per-endpoint rate limit status with Retry-After support
     def _update_rate_limit(self, endpoint_key: str, headers: httpx.Headers) -> None:
         status = RateLimitStatus.from_headers(headers)
         self._rate_limits[endpoint_key] = status
@@ -254,7 +243,6 @@ class XClient:
         except (ValueError, KeyError):
             return response.text or f"HTTP {response.status_code}"
 
-    # FIX #E4.1 (per Maya): Extract Retry-After seconds from response headers
     def _extract_retry_after(self, headers: httpx.Headers) -> float | None:
         retry_after = headers.get("retry-after")
         if not retry_after:
@@ -264,7 +252,6 @@ class XClient:
             return float(stripped)
         return None
 
-    # FIX #E4.1, #E4.2 & #E3.1 (per Maya & Raj): Exponential backoff with jitter and Retry-After header respect
     async def _send_request(
         self,
         method: str,
@@ -384,7 +371,6 @@ class XClient:
             raise XValidationError(
                 f"Search query exceeds X API limit of 512 characters (length: {len(clean_query)})."
             )
-        # FIX #H3.1 (per Karen): Strict validation for sort_order
         if sort_order not in _ALLOWED_SORT_ORDERS:
             raise XValidationError(
                 f"Invalid sort_order '{sort_order}'. Must be one of: {sorted(_ALLOWED_SORT_ORDERS)}"
@@ -457,7 +443,6 @@ class XClient:
             raise XValidationError(
                 f"Search query exceeds full-archive limit of 1024 characters (length: {len(clean_query)})."
             )
-        # FIX #H3.1 (per Karen): Strict validation for sort_order
         if sort_order not in _ALLOWED_SORT_ORDERS:
             raise XValidationError(
                 f"Invalid sort_order '{sort_order}'. Must be one of: {sorted(_ALLOWED_SORT_ORDERS)}"
@@ -480,7 +465,6 @@ class XClient:
         if end_time and end_time.strip():
             validated_end = validate_iso_timestamp("end_time", end_time)
             params["end_time"] = validated_end
-        # FIX #E3.1 & #E2.1 (per Raj & Natasha): Fail fast on inverted time ranges
         validate_time_range(validated_start, validated_end)
 
         if next_token and next_token.strip():
@@ -539,7 +523,6 @@ class XClient:
         if end_time and end_time.strip():
             validated_end = validate_iso_timestamp("end_time", end_time)
             params["end_time"] = validated_end
-        # FIX #E3.1 & #E2.1 (per Raj & Natasha): Fail fast on inverted time ranges
         validate_time_range(validated_start, validated_end)
 
         if next_token and next_token.strip():
@@ -566,7 +549,6 @@ class XClient:
                         continue
 
         meta = payload.get("meta") or {}
-        # FIX #E4.1 (per Maya): Defensive null guard prevents int(None) crash on null meta values
         raw_total = meta.get("total_tweet_count")
         if raw_total is not None:
             try:

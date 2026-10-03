@@ -51,7 +51,6 @@ def test_format_post():
     assert "https://x.com/testuser/status/999" in formatted
 
 
-# FIX #E2.1 (per Natasha): Test markdown formatting with adversarial and injection inputs
 def test_format_post_adversarial_injection():
     author = Author(id="666", username="attacker", name="Evil <script>alert(1)</script>")
     post = Post(
@@ -72,7 +71,6 @@ def test_format_search_response_empty():
     assert "No posts found" in format_search_response(res, scope_label="")
 
 
-# FIX #H2.1 & #E5.1 (per Jake & Tom): Use centralized mock_server_client fixture
 @pytest.mark.asyncio
 async def test_search_recent_posts_tool_success(mock_server_client: AsyncMock):
     author = Author(id="123", username="testuser", name="Test User")
