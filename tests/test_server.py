@@ -250,8 +250,8 @@ async def test_check_rate_limits_seeded_default(mock_server_client: AsyncMock):
     )
     output = await check_rate_limits("search")
     assert "No requests have been executed yet for `search`" in output
-    assert "Reference Standard Quota" in output
-    assert "450 app / 180 user requests" in output
+    assert "vary dynamically based on account tier" in output
+    assert "Real-time quota tracking" in output
 
 
 @pytest.mark.asyncio
@@ -281,3 +281,17 @@ async def test_mcp_error_boundary_logs_exception():
         assert "Unexpected type error!" in output
         mock_log.assert_called_once()
         assert "bad_tool" in mock_log.call_args[0][1]
+
+
+def test_configure_logging_env_override():
+    import logging
+
+    from x_search.server import configure_logging
+
+    with patch.dict("os.environ", {"X_SEARCH_LOG_LEVEL": "DEBUG"}):
+        configure_logging()
+        assert logging.getLogger("x_search").level == logging.DEBUG
+
+    with patch.dict("os.environ", {"X_SEARCH_LOG_LEVEL": "WARNING"}):
+        configure_logging()
+        assert logging.getLogger("x_search").level == logging.WARNING

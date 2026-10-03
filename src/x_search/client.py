@@ -1,3 +1,5 @@
+"""HTTP client for interacting with the X (Twitter) API v2."""
+
 import asyncio
 import logging
 import os
@@ -11,8 +13,6 @@ from urllib.parse import urlparse
 import httpx
 from dotenv import find_dotenv, load_dotenv
 
-logger = logging.getLogger("x_search.client")
-
 from x_search.models import (
     Author,
     CountBucket,
@@ -24,6 +24,8 @@ from x_search.models import (
 )
 
 load_dotenv(find_dotenv(usecwd=True))
+
+logger = logging.getLogger("x_search.client")
 
 
 class XSearchError(Exception):
@@ -218,14 +220,11 @@ class XClient:
 
     def _update_rate_limit(self, endpoint_key: str, headers: httpx.Headers) -> None:
         status = RateLimitStatus.from_headers(headers)
-        # Prevent unbounded map growth by confining to recognized endpoint categories
-        known_keys = {"search", "search_all", "tweets", "counts"}
-        key = endpoint_key if endpoint_key in known_keys else "search"
-        self._rate_limits[key] = status
+        self._rate_limits[endpoint_key] = status
         self._rate_limits["_last"] = status
         logger.debug(
             "Rate limit updated for %s: %s/%s remaining (resets in %ss)",
-            key,
+            endpoint_key,
             status.remaining,
             status.limit,
             status.reset_seconds,

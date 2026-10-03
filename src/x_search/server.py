@@ -1,13 +1,14 @@
+"""FastMCP server exposing tools for searching X (Twitter) and inspecting posts."""
+
 import functools
 import logging
+import os
+import sys
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from typing import Any
 
-try:
-    from mcp.server.mcpserver import MCPServer
-except ImportError:
-    from mcp.server.fastmcp import FastMCP as MCPServer
+from mcp.server.mcpserver import MCPServer
 
 from x_search.client import (
     XAPIAuthError,
@@ -19,6 +20,20 @@ from x_search.client import (
 )
 from x_search.models import Post, PostCountsResponse, SearchResponse
 
+
+def configure_logging() -> None:
+    """Configure explicit, stderr-anchored logging driven by X_SEARCH_LOG_LEVEL."""
+    level_name = os.getenv("X_SEARCH_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        stream=sys.stderr,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    logging.getLogger("x_search").setLevel(level)
+
+
+configure_logging()
 logger = logging.getLogger("x_search.server")
 
 
@@ -195,14 +210,6 @@ def format_post_counts(res: PostCountsResponse, query: str, full_archive: bool) 
     return "\n".join(out)
 
 
-STANDARD_QUOTAS: dict[str, str] = {
-    "search": "450 app / 180 user requests per 15-minute window",
-    "search_all": "300 requests per 15-minute window (Pro/Archive tier)",
-    "tweets": "900 requests per 15-minute window",
-    "counts": "300 requests per 15-minute window",
-}
-
-
 @mcp.tool()
 @mcp_error_boundary
 async def search_recent_posts(
@@ -274,14 +281,12 @@ async def check_rate_limits(endpoint: str = "search") -> str:
     }.get(clean_endpoint, clean_endpoint.capitalize())
 
     if status.limit is None:
-        ref_quota = STANDARD_QUOTAS.get(
-            clean_endpoint, "Varies by subscription tier (per 15-minute window)"
-        )
         return (
             f"### X {category_name} Rate Limit Status\n\n"
-            f"No requests have been executed yet for `{clean_endpoint}` in this session.\n\n"
-            f"- **Reference Standard Quota:** {ref_quota}\n"
-            "- **Live Tracking:** Exact remaining quota and reset countdown will be populated upon your first API call to this endpoint."
+            f"No requests have been executed yet for `{clean_endpoint}` in the current session.\n\n"
+            "> **Note:** X API rate limits vary dynamically based on account tier (Free, Basic, Pro, Enterprise) "
+            "and authentication mode (User Context vs. App-Only Bearer Token). "
+            "Real-time quota tracking and countdown timers will automatically populate from response headers upon your first API call to this endpoint."
         )
 
     reset_str = status.reset_at.strftime("%Y-%m-%d %H:%M:%S UTC") if status.reset_at else "Unknown"
