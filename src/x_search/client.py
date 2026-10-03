@@ -4,7 +4,7 @@ import asyncio
 import os
 import random
 import re
-from datetime import UTC, datetime
+from datetime import datetime
 from types import TracebackType
 from typing import Any, Self
 from urllib.parse import urlparse
@@ -88,6 +88,21 @@ def extract_post_id(post_id_or_url: str) -> str:
     raise XValidationError(f"Invalid post ID or URL: {post_id_or_url}")
 
 
+# FIX #E2.1 (per Natasha): Strict ISO 8601 timestamp validation helper
+def validate_iso_timestamp(param_name: str, ts_str: str) -> str:
+    """Validate that timestamp string conforms to ISO 8601."""
+    cleaned = ts_str.strip()
+    if not cleaned:
+        raise XValidationError(f"Timestamp '{param_name}' cannot be empty.")
+    try:
+        datetime.fromisoformat(cleaned)
+        return cleaned
+    except ValueError as e:
+        raise XValidationError(
+            f"Invalid '{param_name}' timestamp format: '{ts_str}'. Expected ISO 8601 (e.g. '2026-01-01T00:00:00Z')."
+        ) from e
+
+
 class XClient:
     """Client for X API v2 recent search, full-archive search, counts, and post endpoints."""
 
@@ -118,7 +133,8 @@ class XClient:
         # FIX #E4.1 & #H4.1 (per Maya & Tyler): Persistent connection pool & client reuse
         self._external_client = http_client
         self._internal_client: httpx.AsyncClient | None = None
-        self._client_lock = asyncio.Lock()
+        # FIX #H1.1 (per Kyle): Lock is initialized lazily to avoid event-loop binding hazards
+        self._client_lock: asyncio.Lock | None = None
 
     @property
     def bearer_token(self) -> str:
@@ -137,12 +153,18 @@ class XClient:
     def __str__(self) -> str:
         return self.__repr__()
 
+    # FIX #H1.1 (per Kyle): Lazy event loop lock initialization
+    def _get_lock(self) -> asyncio.Lock:
+        if self._client_lock is None:
+            self._client_lock = asyncio.Lock()
+        return self._client_lock
+
     async def _get_http_client(self) -> httpx.AsyncClient:
         """Returns the shared connection-pooled HTTP client."""
         if self._external_client:
             return self._external_client
         if self._internal_client is None or self._internal_client.is_closed:
-            async with self._client_lock:
+            async with self._get_lock():
                 if self._internal_client is None or self._internal_client.is_closed:
                     self._internal_client = httpx.AsyncClient(
                         timeout=self._timeout,
@@ -152,7 +174,7 @@ class XClient:
 
     async def aclose(self) -> None:
         """Close managed network resources."""
-        async with self._client_lock:
+        async with self._get_lock():
             if self._internal_client and not self._internal_client.is_closed:
                 await self._internal_client.aclose()
                 self._internal_client = None
@@ -175,24 +197,9 @@ class XClient:
             "Accept": "application/json",
         }
 
+    # FIX #E4.2 (per Maya): Uses RateLimitStatus.from_headers with Retry-After support
     def _update_rate_limit(self, headers: httpx.Headers) -> None:
-        limit = headers.get("x-rate-limit-limit")
-        remaining = headers.get("x-rate-limit-remaining")
-        reset = headers.get("x-rate-limit-reset")
-
-        limit_int = int(limit) if limit and limit.isdigit() else None
-        remaining_int = int(remaining) if remaining and remaining.isdigit() else None
-
-        reset_at: datetime | None = None
-        if reset and reset.isdigit():
-            reset_ts = int(reset)
-            reset_at = datetime.fromtimestamp(reset_ts, UTC)
-
-        self._last_rate_limit = RateLimitStatus(
-            limit=limit_int,
-            remaining=remaining_int,
-            reset_at=reset_at,
-        )
+        self._last_rate_limit = RateLimitStatus.from_headers(headers)
 
     def get_rate_limit_status(self) -> RateLimitStatus:
         """Returns the most recent rate limit status."""
@@ -214,7 +221,7 @@ class XClient:
         except (ValueError, KeyError):
             return response.text or f"HTTP {response.status_code}"
 
-    # FIX #E4.2 (per Maya): Exponential backoff with jitter for transient 5xx & network drops
+    # FIX #E4.2 & #E3.1 (per Maya & Raj): Exponential backoff with jitter for transient 5xx, timeouts & dropped sockets
     async def _send_request(
         self, method: str, url: str, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -236,7 +243,7 @@ class XClient:
 
                 return self._handle_response(res)
 
-            except (httpx.ConnectError, httpx.TimeoutException) as e:
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.ProtocolError) as e:
                 if attempt < self._max_retries:
                     attempt += 1
                     sleep_time = (self._backoff_base * (2**attempt)) + random.uniform(0.01, 0.05)
@@ -405,9 +412,9 @@ class XClient:
             "sort_order": sort_order,
         }
         if start_time and start_time.strip():
-            params["start_time"] = start_time.strip()
+            params["start_time"] = validate_iso_timestamp("start_time", start_time)
         if end_time and end_time.strip():
-            params["end_time"] = end_time.strip()
+            params["end_time"] = validate_iso_timestamp("end_time", end_time)
         if next_token and next_token.strip():
             params["next_token"] = next_token.strip()
 
@@ -456,9 +463,9 @@ class XClient:
             "granularity": granularity,
         }
         if start_time and start_time.strip():
-            params["start_time"] = start_time.strip()
+            params["start_time"] = validate_iso_timestamp("start_time", start_time)
         if end_time and end_time.strip():
-            params["end_time"] = end_time.strip()
+            params["end_time"] = validate_iso_timestamp("end_time", end_time)
         if next_token and next_token.strip():
             params["next_token"] = next_token.strip()
 
@@ -483,7 +490,16 @@ class XClient:
                         continue
 
         meta = payload.get("meta") or {}
-        total_count = int(meta.get("total_tweet_count", sum(b.tweet_count for b in buckets)))
+        # FIX #E4.1 (per Maya): Defensive null guard prevents int(None) crash on null meta values
+        raw_total = meta.get("total_tweet_count")
+        if raw_total is not None:
+            try:
+                total_count = int(raw_total)
+            except (ValueError, TypeError):
+                total_count = sum(b.tweet_count for b in buckets)
+        else:
+            total_count = sum(b.tweet_count for b in buckets)
+
         return PostCountsResponse(
             total_count=total_count,
             granularity=granularity,

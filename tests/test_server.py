@@ -209,3 +209,17 @@ async def test_get_post_counts_tool_success():
         assert "3,500" in output
         assert "Total Posts" in output
         assert "2026-10-01" in output
+
+
+@pytest.mark.asyncio
+async def test_search_full_archive_posts_auth_help():
+    from x_search.server import search_full_archive_posts
+
+    with patch("x_search.server.get_client") as mock_get_client:
+        mock_client = AsyncMock()
+        mock_client.search_all.side_effect = XAPIAuthError("Forbidden access")
+        mock_get_client.return_value = mock_client
+
+        output = await search_full_archive_posts("test")
+        assert "Authentication Failure" in output
+        assert "Full-archive search requires an X developer account tier" in output

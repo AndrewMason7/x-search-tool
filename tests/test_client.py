@@ -438,3 +438,72 @@ async def test_client_transient_retry_success(sample_single_post_json: dict[str,
         post = await client.get_post("1840000000000000001")
         assert calls == 2
         assert post.id == "1840000000000000001"
+
+
+@pytest.mark.asyncio
+async def test_get_counts_null_meta_total_tweet_count():
+    # Simulates zero-match response where X API sets total_tweet_count to null
+    payload: dict[str, Any] = {
+        "data": [],
+        "meta": {"total_tweet_count": None},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = XClient(bearer_token="test_token", http_client=http_client)
+        counts = await client.get_counts(query="nonexistent_trend")
+        assert counts.total_count == 0
+        assert len(counts.buckets) == 0
+
+
+def test_validate_iso_timestamp_valid_and_invalid():
+    from x_search.client import validate_iso_timestamp
+
+    assert validate_iso_timestamp("start_time", "2026-01-01T00:00:00Z") == "2026-01-01T00:00:00Z"
+    assert (
+        validate_iso_timestamp("start_time", "2026-10-03T12:00:00+00:00")
+        == "2026-10-03T12:00:00+00:00"
+    )
+
+    with pytest.raises(XValidationError, match="Invalid 'start_time' timestamp format"):
+        validate_iso_timestamp("start_time", "yesterday")
+
+    with pytest.raises(XValidationError, match="cannot be empty"):
+        validate_iso_timestamp("start_time", "   ")
+
+
+@pytest.mark.asyncio
+async def test_search_all_invalid_start_time():
+    async with httpx.AsyncClient() as http_client:
+        client = XClient(bearer_token="test_token", http_client=http_client)
+        with pytest.raises(XValidationError, match="Invalid 'start_time' timestamp format"):
+            await client.search_all(query="python", start_time="yesterday")
+
+
+@pytest.mark.asyncio
+async def test_client_transient_retry_remote_protocol_error(
+    sample_single_post_json: dict[str, Any],
+):
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.RemoteProtocolError("Server disconnected without response")
+        return httpx.Response(200, json=sample_single_post_json)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = XClient(
+            bearer_token="test_token",
+            http_client=http_client,
+            max_retries=2,
+            backoff_base=0.01,
+        )
+        post = await client.get_post("1840000000000000001")
+        assert calls == 2
+        assert post.id == "1840000000000000001"

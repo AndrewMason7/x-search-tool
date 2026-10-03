@@ -106,3 +106,27 @@ def test_post_counts_models():
     assert resp.granularity == "day"
     assert len(resp.buckets) == 1
     assert resp.next_token == "token_count"
+
+
+def test_rate_limit_from_headers_retry_after_delta():
+    headers = {"retry-after": "120"}
+    status = RateLimitStatus.from_headers(headers)
+    assert status.reset_seconds is not None
+    assert 115 <= status.reset_seconds <= 120
+
+
+def test_rate_limit_from_headers_retry_after_date():
+    future_dt = datetime.now(UTC) + timedelta(seconds=180)
+    headers = {"retry-after": future_dt.strftime("%a, %d %b %Y %H:%M:%S GMT")}
+    status = RateLimitStatus.from_headers(headers)
+    assert status.reset_seconds is not None
+    assert 170 <= status.reset_seconds <= 185
+
+
+def test_models_are_frozen():
+    import pytest
+    from pydantic import ValidationError
+
+    author = Author(id="1", username="u", name="n")
+    with pytest.raises(ValidationError):
+        author.username = "mutated"  # type: ignore[misc]

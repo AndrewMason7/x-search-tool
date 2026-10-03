@@ -43,41 +43,51 @@ def get_client() -> XClient:
     return _client_instance
 
 
-# FIX #E5.1 & #H2.1 (per Tom & Jake): Unified MCP error boundary decorator eliminating 80+ lines of duplicate catch blocks
+# FIX #E5.1 & #E1.1 (per Tom & Marcus): Contextual MCP error boundary decorator with customizable auth help
 def mcp_error_boundary(
-    func: Callable[..., Coroutine[Any, Any, str]],
-) -> Callable[..., Coroutine[Any, Any, str]]:
-    """Decorator converting client exceptions into clean, formatted user guidance."""
+    func: Callable[..., Coroutine[Any, Any, str]] | None = None,
+    *,
+    auth_help: str | None = None,
+) -> Any:
+    """Decorator converting client exceptions into clean, formatted user guidance with custom hints."""
 
-    @functools.wraps(func)
-    async def wrapper(*args: Any, **kwargs: Any) -> str:
-        try:
-            return await func(*args, **kwargs)
-        except XCredentialsError:
-            return CREDENTIALS_HELP
-        except XValidationError as e:
-            return f"### Invalid Input\n\n{e}"
-        except XRateLimitError as e:
-            countdown = (
-                f"\n\n**Countdown to Reset:** ~{e.rate_limit.reset_seconds} seconds"
-                if e.rate_limit and e.rate_limit.reset_seconds is not None
-                else ""
-            )
-            return (
-                f"### Rate Limit Exceeded\n\n{e}{countdown}\n"
-                "Please wait until the rate limit window resets before querying again."
-            )
-        except XAPIAuthError as e:
-            return (
-                f"### Authentication Failure\n\n{e}\n"
-                "Please verify that your X Bearer Token is valid and has search permissions."
-            )
-        except XAPIError as e:
-            return f"### X API Error\n\n{e}"
-        except Exception as e:  # noqa: BLE001
-            return f"### Unexpected Error\n\n{e}"
+    def decorator(
+        f: Callable[..., Coroutine[Any, Any, str]],
+    ) -> Callable[..., Coroutine[Any, Any, str]]:
+        @functools.wraps(f)
+        async def wrapper(*args: Any, **kwargs: Any) -> str:
+            try:
+                return await f(*args, **kwargs)
+            except XCredentialsError:
+                return CREDENTIALS_HELP
+            except XValidationError as e:
+                return f"### Invalid Input\n\n{e}"
+            except XRateLimitError as e:
+                countdown = (
+                    f"\n\n**Countdown to Reset:** ~{e.rate_limit.reset_seconds} seconds"
+                    if e.rate_limit and e.rate_limit.reset_seconds is not None
+                    else ""
+                )
+                return (
+                    f"### Rate Limit Exceeded\n\n{e}{countdown}\n"
+                    "Please wait until the rate limit window resets before querying again."
+                )
+            except XAPIAuthError as e:
+                hint = (
+                    auth_help
+                    or "Please verify that your X Bearer Token is valid and has search permissions."
+                )
+                return f"### Authentication Failure\n\n{e}\n{hint}"
+            except XAPIError as e:
+                return f"### X API Error\n\n{e}"
+            except Exception as e:  # noqa: BLE001
+                return f"### Unexpected Error\n\n{e}"
 
-    return wrapper
+        return wrapper
+
+    if func is not None:
+        return decorator(func)
+    return decorator
 
 
 def format_post(post: Post) -> str:
@@ -117,13 +127,15 @@ def format_post(post: Post) -> str:
     return "\n".join(lines)
 
 
-def format_search_response(res: SearchResponse) -> str:
+# FIX #E5.1 (per Tom): Semantic scope parameter eliminates claiming 2006 historical tweets are "recent"
+def format_search_response(res: SearchResponse, scope_label: str = "recent") -> str:
     """Format SearchResponse into a structured Markdown document."""
+    label = f" {scope_label}" if scope_label else ""
     if not res.posts:
-        return "No recent posts found matching your search query."
+        return f"No{label} posts found matching your search query."
 
     out: list[str] = [
-        f"Found **{res.result_count}** recent post{'s' if res.result_count != 1 else ''}:\n"
+        f"Found **{res.result_count}**{label} post{'s' if res.result_count != 1 else ''}:\n"
     ]
     for i, post in enumerate(res.posts, 1):
         out.append(f"#### Post {i}")
@@ -194,7 +206,7 @@ async def search_recent_posts(
         max_results=max_results,
         next_token=next_token,
     )
-    return format_search_response(res)
+    return format_search_response(res, scope_label="recent")
 
 
 @mcp.tool()
@@ -234,7 +246,9 @@ async def check_rate_limits() -> str:
 
 
 @mcp.tool()
-@mcp_error_boundary
+@mcp_error_boundary(
+    auth_help="Full-archive search requires an X developer account tier with archive access (Pro or Academic)."
+)
 async def search_full_archive_posts(
     query: str,
     start_time: str | None = None,
@@ -264,7 +278,7 @@ async def search_full_archive_posts(
         next_token=next_token,
         sort_order=sort_order,
     )
-    return format_search_response(res)
+    return format_search_response(res, scope_label="")
 
 
 @mcp.tool()
