@@ -56,11 +56,7 @@ class XClient:
         bearer_token: str | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
-        token = (
-            bearer_token
-            or os.getenv("X_BEARER_TOKEN")
-            or os.getenv("TWITTER_BEARER_TOKEN")
-        )
+        token = bearer_token or os.getenv("X_BEARER_TOKEN") or os.getenv("TWITTER_BEARER_TOKEN")
         if not token:
             raise ValueError(
                 "X_BEARER_TOKEN or TWITTER_BEARER_TOKEN environment variable not set. "
@@ -165,7 +161,9 @@ class XClient:
             edit_history_tweet_ids=item.get("edit_history_tweet_ids", []),
         )
 
-    async def _send_request(self, method: str, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def _send_request(
+        self, method: str, url: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         headers = self._get_headers()
         if self._external_client:
             res = await self._external_client.request(method, url, headers=headers, params=params)

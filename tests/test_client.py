@@ -178,9 +178,7 @@ async def test_get_post_by_url(sample_single_post_json: dict[str, Any]):
         assert post1.id == "1840000000000000001"
 
         # twitter.com URL
-        post2 = await client.get_post(
-            "https://twitter.com/user/status/1840000000000000001?s=20"
-        )
+        post2 = await client.get_post("https://twitter.com/user/status/1840000000000000001?s=20")
         assert post2.id == "1840000000000000001"
 
 

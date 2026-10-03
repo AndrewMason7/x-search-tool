@@ -1,0 +1,11 @@
+{
+  "name": "x-search",
+  "displayName": "X (Twitter) Search Tool",
+  "description": "Search recent posts on X (Twitter), inspect engagement metrics, and lookup posts by ID or URL via X API v2.",
+  "version": "0.1.0",
+  "suggestedPrompts": [
+    "Search X for recent posts about Python 3.13",
+    "Find recent high-engagement posts mentioning @OpenAI",
+    "Lookup this post on X: https://x.com/user/status/123456789"
+  ]
+}

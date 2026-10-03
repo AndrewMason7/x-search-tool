@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "x-search": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/Users/andrew/Documents/GitHub/x-search-tool",
+        "x-search"
+      ],
+      "env": {}
+    }
+  }
+}

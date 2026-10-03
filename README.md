@@ -1,3 +1,108 @@
-# x-search-tool
+# X (Twitter) Search Tool & MCP Server
 
-X (Twitter) recent search MCP server and tool suite for AI agents.
+An asynchronous Model Context Protocol (MCP) server and Antigravity plugin for searching recent posts on X (Twitter), inspecting engagement metrics, looking up individual posts, and managing rate limits via the X API v2.
+
+---
+
+## Features
+
+- **Recent Search (v2):** Search posts from the last 7 days with rich operator support (`from:`, `to:`, `@mention`, `#hashtag`, `url:`, `lang:en`, `-is:retweet`, `-is:reply`, `has:media`).
+- **Hydrated Data:** Automatic resolution of author handles, verified badges, profile pictures, and engagement metrics (likes, reposts, replies, views).
+- **Post Lookup:** Fetch single posts using either numeric status IDs or full URLs (`https://x.com/...` or `https://twitter.com/...`).
+- **Rate Limit Tracking:** Real-time quota tracking (`x-rate-limit-remaining`, `x-rate-limit-reset`) with actionable countdowns.
+- **FastMCP & stdio:** Built on the official Python MCP SDK with stdio transport.
+- **Agent Skill & Antigravity Plugin:** Bundled with `plugin.json`, `mcp_config.json`, and `skills/x-search/SKILL.md` for instant agent adoption.
+
+---
+
+## Quickstart & Installation
+
+### 1. Prerequisites
+- Python 3.12+
+- [`uv`](https://docs.astral.sh/uv/) package manager
+- An X API Developer App Bearer Token (obtain from [developer.x.com](https://developer.x.com/en/portal/dashboard))
+
+### 2. Configure Credentials
+Copy `.env.example` to `.env` and set your Bearer Token:
+```bash
+cp .env.example .env
+# Edit .env and paste your token:
+# X_BEARER_TOKEN="your_token_here"
+```
+Or export it in your shell environment:
+```bash
+export X_BEARER_TOKEN="your_token_here"
+```
+
+### 3. Install Dependencies
+```bash
+uv sync
+```
+
+---
+
+## Usage as an Antigravity Plugin
+
+To install this tool directly into Antigravity:
+1. Symlink or copy the repository directory to `~/.gemini/config/plugins/x-search`:
+   ```bash
+   ln -s /Users/andrew/Documents/GitHub/x-search-tool ~/.gemini/config/plugins/x-search
+   ```
+2. Restart Antigravity or reload plugins. The `x-search` skill and tools will be available automatically to all agents.
+
+---
+
+## Usage with Other MCP Hosts (Claude Code, Cursor, Windsurf)
+
+Add the following entry to your `mcp.json` or `mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "x-search": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/Users/andrew/Documents/GitHub/x-search-tool",
+        "x-search"
+      ],
+      "env": {
+        "X_BEARER_TOKEN": "YOUR_BEARER_TOKEN"
+      }
+    }
+  }
+}
+```
+
+---
+
+## MCP Tools Reference
+
+### `search_recent_posts`
+Searches posts from the last 7 days.
+- `query` (str): Search query with optional boolean operators (e.g., `"deepseek" lang:en -is:retweet`).
+- `max_results` (int, optional): Number of posts to return (10 to 100, default: 10).
+- `next_token` (str, optional): Pagination token for loading subsequent pages.
+
+### `get_post`
+Retrieves detailed information for a single post.
+- `post_id_or_url` (str): Numeric status ID or full status URL.
+
+### `check_rate_limits`
+Returns remaining API requests and countdown seconds until rate limit reset.
+
+---
+
+## Testing & Quality
+
+Run the automated test suite:
+```bash
+uv run pytest -v
+```
+
+Run code formatting and linting:
+```bash
+uv run ruff check .
+uv run ruff format --check .
+```
