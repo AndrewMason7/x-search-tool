@@ -22,18 +22,33 @@ from x_search.models import Post, PostCountsResponse, SearchResponse
 
 
 def configure_logging() -> None:
-    """Configure explicit, stderr-anchored logging driven by X_SEARCH_LOG_LEVEL."""
+    """Configure explicit, stderr-anchored logging driven by X_SEARCH_LOG_LEVEL.
+
+    Only the ``x_search`` package honours ``X_SEARCH_LOG_LEVEL``. The root logger is
+    pinned to WARNING so third-party loggers (httpcore, httpx, asyncio, mcp) cannot
+    flood stderr at DEBUG -- stderr is piped into the MCP host's own logs.
+
+    This attaches a dedicated handler to the ``x_search`` logger rather than relying
+    on ``logging.basicConfig()``: the mcp SDK installs its own root handler during
+    import, which makes any later ``basicConfig()`` a silent no-op (so the requested
+    stream and format would never be applied). Safe to call more than once.
+    """
     level_name = os.getenv("X_SEARCH_LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-    logging.basicConfig(
-        level=level,
-        stream=sys.stderr,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-    logging.getLogger("x_search").setLevel(level)
+
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+
+    package_logger = logging.getLogger("x_search")
+    for existing in list(package_logger.handlers):
+        package_logger.removeHandler(existing)
+    package_logger.addHandler(handler)
+    package_logger.setLevel(level)
+    package_logger.propagate = False
+
+    logging.getLogger().setLevel(logging.WARNING)
 
 
-configure_logging()
 logger = logging.getLogger("x_search.server")
 
 
