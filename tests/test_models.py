@@ -1,6 +1,17 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from x_search.models import Author, Post, PublicMetrics, RateLimitStatus, SearchResponse
+import pytest
+from pydantic import ValidationError
+
+from x_search.models import (
+    Author,
+    CountBucket,
+    Post,
+    PostCountsResponse,
+    PublicMetrics,
+    RateLimitStatus,
+    SearchResponse,
+)
 
 
 def test_author_model():
@@ -67,7 +78,6 @@ def test_search_response_model():
     assert res.next_token == "token_abc"
 
 
-from datetime import timedelta
 
 
 def test_rate_limit_status():
@@ -89,7 +99,6 @@ def test_rate_limit_status_naive_datetime():
 
 
 def test_post_counts_models():
-    from x_search.models import CountBucket, PostCountsResponse
 
     start = datetime(2026, 10, 1, 0, 0, 0, tzinfo=UTC)
     end = datetime(2026, 10, 2, 0, 0, 0, tzinfo=UTC)
@@ -108,25 +117,41 @@ def test_post_counts_models():
     assert resp.next_token == "token_count"
 
 
+# FIX #E4.1 (per Maya): Deterministic assertion testing on calculated reset_at boundaries
 def test_rate_limit_from_headers_retry_after_delta():
     headers = {"retry-after": "120"}
+    before = datetime.now(UTC)
     status = RateLimitStatus.from_headers(headers)
+    after = datetime.now(UTC)
+    assert status.reset_at is not None
+    # Verify reset_at falls squarely within [before + 120s, after + 120s]
+    assert before + timedelta(seconds=120) <= status.reset_at <= after + timedelta(seconds=120)
     assert status.reset_seconds is not None
-    assert 115 <= status.reset_seconds <= 120
+    assert 118 <= status.reset_seconds <= 120
 
 
 def test_rate_limit_from_headers_retry_after_date():
-    future_dt = datetime.now(UTC) + timedelta(seconds=180)
-    headers = {"retry-after": future_dt.strftime("%a, %d %b %Y %H:%M:%S GMT")}
+    target_dt = (datetime.now(UTC) + timedelta(seconds=180)).replace(microsecond=0)
+    headers = {"retry-after": target_dt.strftime("%a, %d %b %Y %H:%M:%S GMT")}
     status = RateLimitStatus.from_headers(headers)
+    assert status.reset_at is not None
+    assert abs((status.reset_at - target_dt).total_seconds()) <= 1.0
     assert status.reset_seconds is not None
-    assert 170 <= status.reset_seconds <= 185
+    assert 178 <= status.reset_seconds <= 180
+
+
+def test_rate_limit_from_headers_invalid_retry_after():
+    # Negative or non-numeric/non-date headers should result in None
+    status = RateLimitStatus.from_headers({"retry-after": "-50"})
+    assert status.reset_at is None
+    assert status.reset_seconds is None
+
+    status_bad = RateLimitStatus.from_headers({"retry-after": "invalid_date_format"})
+    assert status_bad.reset_at is None
+    assert status_bad.reset_seconds is None
 
 
 def test_models_are_frozen():
-    import pytest
-    from pydantic import ValidationError
-
     author = Author(id="1", username="u", name="n")
     with pytest.raises(ValidationError):
         author.username = "mutated"  # type: ignore[misc]

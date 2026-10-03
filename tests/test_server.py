@@ -1,6 +1,6 @@
-"""Unit tests for FastMCP server tool handlers and formatting."""
+"""Unit tests for FastMCP server tool handlers, formatting, and security boundaries."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -11,8 +11,24 @@ from x_search.client import (
     XRateLimitError,
     XValidationError,
 )
-from x_search.models import Author, Post, PublicMetrics, RateLimitStatus, SearchResponse
-from x_search.server import check_rate_limits, format_post, get_post, search_recent_posts
+from x_search.models import (
+    Author,
+    CountBucket,
+    Post,
+    PostCountsResponse,
+    PublicMetrics,
+    RateLimitStatus,
+    SearchResponse,
+)
+from x_search.server import (
+    check_rate_limits,
+    format_post,
+    format_search_response,
+    get_post,
+    get_post_counts,
+    search_full_archive_posts,
+    search_recent_posts,
+)
 
 
 def test_format_post():
@@ -35,34 +51,48 @@ def test_format_post():
     assert "https://x.com/testuser/status/999" in formatted
 
 
+# FIX #E2.1 (per Natasha): Test markdown formatting with adversarial and injection inputs
+def test_format_post_adversarial_injection():
+    author = Author(id="666", username="attacker", name="Evil <script>alert(1)</script>")
+    post = Post(
+        id="999",
+        text="[Click me](javascript:alert(1)) and `code injection`\n> Quote bypass",
+        author=author,
+    )
+    formatted = format_post(post)
+    # Ensure raw author name is quoted in bold and tweet body lines are strictly blockquoted
+    assert "**Evil <script>alert(1)</script>**" in formatted
+    assert "> [Click me](javascript:alert(1))" in formatted
+    assert "> > Quote bypass" in formatted
+
+
+def test_format_search_response_empty():
+    res = SearchResponse(posts=[], result_count=0)
+    assert "No recent posts found" in format_search_response(res, scope_label="recent")
+    assert "No posts found" in format_search_response(res, scope_label="")
+
+
+# FIX #H2.1 & #E5.1 (per Jake & Tom): Use centralized mock_server_client fixture
 @pytest.mark.asyncio
-async def test_search_recent_posts_tool_success():
+async def test_search_recent_posts_tool_success(mock_server_client: AsyncMock):
     author = Author(id="123", username="testuser", name="Test User")
     post = Post(id="999", text="Hello AI", author=author)
     mock_resp = SearchResponse(posts=[post], result_count=1, next_token="token_xyz")
+    mock_server_client.search_recent.return_value = mock_resp
 
-    with patch("x_search.server.get_client") as mock_get_client:
-        mock_client = AsyncMock()
-        mock_client.search_recent.return_value = mock_resp
-        mock_get_client.return_value = mock_client
-
-        output = await search_recent_posts("Hello AI", max_results=10)
-        assert "@testuser" in output
-        assert "Hello AI" in output
-        assert "token_xyz" in output
+    output = await search_recent_posts("Hello AI", max_results=10)
+    assert "@testuser" in output
+    assert "Hello AI" in output
+    assert "token_xyz" in output
 
 
 @pytest.mark.asyncio
-async def test_search_recent_posts_tool_empty():
+async def test_search_recent_posts_tool_empty(mock_server_client: AsyncMock):
     mock_resp = SearchResponse(posts=[], result_count=0)
+    mock_server_client.search_recent.return_value = mock_resp
 
-    with patch("x_search.server.get_client") as mock_get_client:
-        mock_client = AsyncMock()
-        mock_client.search_recent.return_value = mock_resp
-        mock_get_client.return_value = mock_client
-
-        output = await search_recent_posts("nonexistent_query_xyz")
-        assert "No recent posts found" in output
+    output = await search_recent_posts("nonexistent_query_xyz")
+    assert "No recent posts found" in output
 
 
 @pytest.mark.asyncio
@@ -77,59 +107,44 @@ async def test_search_recent_posts_missing_token():
 
 
 @pytest.mark.asyncio
-async def test_search_recent_posts_validation_error():
-    with patch(
-        "x_search.server.get_client",
-        side_effect=XValidationError("Query too long"),
-    ):
-        output = await search_recent_posts("test")
-        assert "Invalid Input" in output
-        assert "Query too long" in output
+async def test_search_recent_posts_validation_error(mock_server_client: AsyncMock):
+    mock_server_client.search_recent.side_effect = XValidationError("Query too long")
 
-
-from datetime import timedelta
+    output = await search_recent_posts("test")
+    assert "Invalid Input" in output
+    assert "Query too long" in output
 
 
 @pytest.mark.asyncio
-async def test_search_recent_posts_rate_limited():
+async def test_search_recent_posts_rate_limited(mock_server_client: AsyncMock):
     future = datetime.now(UTC) + timedelta(seconds=300)
     status = RateLimitStatus(limit=180, remaining=0, reset_at=future)
-    with patch("x_search.server.get_client") as mock_get_client:
-        mock_client = AsyncMock()
-        mock_client.search_recent.side_effect = XRateLimitError(
-            "Rate limit exceeded", rate_limit=status
-        )
-        mock_get_client.return_value = mock_client
+    mock_server_client.search_recent.side_effect = XRateLimitError(
+        "Rate limit exceeded", rate_limit=status
+    )
 
-        output = await search_recent_posts("test")
-        assert "Rate Limit Exceeded" in output
-        assert "Countdown to Reset" in output
+    output = await search_recent_posts("test")
+    assert "Rate Limit Exceeded" in output
+    assert "Countdown to Reset" in output
 
 
 @pytest.mark.asyncio
-async def test_search_recent_posts_auth_error():
-    with patch("x_search.server.get_client") as mock_get_client:
-        mock_client = AsyncMock()
-        mock_client.search_recent.side_effect = XAPIAuthError("Unauthorized token")
-        mock_get_client.return_value = mock_client
+async def test_search_recent_posts_auth_error(mock_server_client: AsyncMock):
+    mock_server_client.search_recent.side_effect = XAPIAuthError("Unauthorized token")
 
-        output = await search_recent_posts("test")
-        assert "Authentication Failure" in output
+    output = await search_recent_posts("test")
+    assert "Authentication Failure" in output
 
 
 @pytest.mark.asyncio
-async def test_get_post_tool_success():
+async def test_get_post_tool_success(mock_server_client: AsyncMock):
     author = Author(id="123", username="testuser", name="Test User")
     post = Post(id="999", text="Specific tweet content", author=author)
+    mock_server_client.get_post.return_value = post
 
-    with patch("x_search.server.get_client") as mock_get_client:
-        mock_client = AsyncMock()
-        mock_client.get_post.return_value = post
-        mock_get_client.return_value = mock_client
-
-        output = await get_post("999")
-        assert "@testuser" in output
-        assert "Specific tweet content" in output
+    output = await get_post("999")
+    assert "@testuser" in output
+    assert "Specific tweet content" in output
 
 
 @pytest.mark.asyncio
@@ -154,43 +169,30 @@ async def test_check_rate_limits_missing_token():
 
 
 @pytest.mark.asyncio
-async def test_check_rate_limits_tool():
+async def test_check_rate_limits_tool(mock_server_client: AsyncMock):
     future = datetime.now(UTC) + timedelta(seconds=420)
     status = RateLimitStatus(limit=180, remaining=150, reset_at=future)
+    mock_server_client.get_rate_limit_status = MagicMock(return_value=status)
 
-    with patch("x_search.server.get_client") as mock_get_client:
-        mock_client = AsyncMock()
-        mock_client.get_rate_limit_status = MagicMock(return_value=status)
-        mock_get_client.return_value = mock_client
-
-        output = await check_rate_limits()
-        assert "150 / 180" in output
-        assert "Countdown:" in output
+    output = await check_rate_limits()
+    assert "150 / 180" in output
+    assert "Countdown:" in output
 
 
 @pytest.mark.asyncio
-async def test_search_full_archive_posts_tool_success():
-    from x_search.server import search_full_archive_posts
-
+async def test_search_full_archive_posts_tool_success(mock_server_client: AsyncMock):
     author = Author(id="123", username="historical", name="Old Account")
     post = Post(id="1", text="Historic tweet from 2007", author=author)
     mock_resp = SearchResponse(posts=[post], result_count=1)
+    mock_server_client.search_all.return_value = mock_resp
 
-    with patch("x_search.server.get_client") as mock_get_client:
-        mock_client = AsyncMock()
-        mock_client.search_all.return_value = mock_resp
-        mock_get_client.return_value = mock_client
-
-        output = await search_full_archive_posts("Historic", max_results=10)
-        assert "@historical" in output
-        assert "Historic tweet from 2007" in output
+    output = await search_full_archive_posts("Historic", max_results=10)
+    assert "@historical" in output
+    assert "Historic tweet from 2007" in output
 
 
 @pytest.mark.asyncio
-async def test_get_post_counts_tool_success():
-    from x_search.models import CountBucket, PostCountsResponse
-    from x_search.server import get_post_counts
-
+async def test_get_post_counts_tool_success(mock_server_client: AsyncMock):
     start = datetime(2026, 10, 1, 0, 0, 0, tzinfo=UTC)
     end = datetime(2026, 10, 2, 0, 0, 0, tzinfo=UTC)
     bucket = CountBucket(start=start, end=end, tweet_count=3500)
@@ -199,27 +201,31 @@ async def test_get_post_counts_tool_success():
         granularity="day",
         buckets=[bucket],
     )
+    mock_server_client.get_counts.return_value = mock_counts
 
-    with patch("x_search.server.get_client") as mock_get_client:
-        mock_client = AsyncMock()
-        mock_client.get_counts.return_value = mock_counts
-        mock_get_client.return_value = mock_client
-
-        output = await get_post_counts("python", granularity="day")
-        assert "3,500" in output
-        assert "Total Posts" in output
-        assert "2026-10-01" in output
+    output = await get_post_counts("python", granularity="day")
+    assert "3,500" in output
+    assert "Total Posts" in output
+    assert "2026-10-01" in output
 
 
 @pytest.mark.asyncio
-async def test_search_full_archive_posts_auth_help():
-    from x_search.server import search_full_archive_posts
+async def test_search_full_archive_posts_auth_help(mock_server_client: AsyncMock):
+    mock_server_client.search_all.side_effect = XAPIAuthError("Forbidden access")
 
-    with patch("x_search.server.get_client") as mock_get_client:
-        mock_client = AsyncMock()
-        mock_client.search_all.side_effect = XAPIAuthError("Forbidden access")
-        mock_get_client.return_value = mock_client
+    output = await search_full_archive_posts("test")
+    assert "Authentication Failure" in output
+    assert "Full-archive search requires an X developer account tier" in output
 
-        output = await search_full_archive_posts("test")
-        assert "Authentication Failure" in output
-        assert "Full-archive search requires an X developer account tier" in output
+
+@pytest.mark.asyncio
+async def test_check_rate_limits_endpoint_scoping(mock_server_client: AsyncMock):
+    future = datetime.now(UTC) + timedelta(seconds=600)
+    status_tweets = RateLimitStatus(limit=900, remaining=850, reset_at=future)
+    mock_server_client.get_rate_limit_status = MagicMock(return_value=status_tweets)
+
+    output = await check_rate_limits(endpoint="tweets")
+    assert "Tweet Lookup Rate Limit Status" in output
+    assert "850 / 900" in output
+    assert "**Endpoint:** `tweets`" in output
+    mock_server_client.get_rate_limit_status.assert_called_with("tweets")

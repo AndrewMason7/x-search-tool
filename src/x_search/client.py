@@ -10,7 +10,7 @@ from typing import Any, Self
 from urllib.parse import urlparse
 
 import httpx
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
 from x_search.models import (
     Author,
@@ -22,7 +22,7 @@ from x_search.models import (
     SearchResponse,
 )
 
-load_dotenv()
+load_dotenv(find_dotenv(usecwd=True))
 
 
 class XSearchError(Exception):
@@ -53,11 +53,12 @@ class XRateLimitError(XSearchError):
         self.rate_limit = rate_limit
 
 
-# FIX #E3.1 & #E2.2 (per Raj & Natasha): Pre-compiled regexes & length-bounded extraction
-_POST_URL_PATTERN = re.compile(r"(?:^|/)status(?:es)?/(\d+)")
+# FIX #E3.1 & #E2.2 (per Raj & Natasha): Pre-compiled regexes with length bounds & clean boundary isolation
+_POST_URL_PATTERN = re.compile(r"(?:^|/)status(?:es)?/(\d{1,30})(?:[/?#]|$)")
 _NUMERIC_ID_PATTERN = re.compile(r"^\d{1,30}$")
 _MAX_POST_INPUT_LEN = 512
 _ALLOWED_DOMAINS = {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}
+_ALLOWED_SORT_ORDERS = {"recency", "relevancy"}
 
 
 def extract_post_id(post_id_or_url: str) -> str:
@@ -88,19 +89,35 @@ def extract_post_id(post_id_or_url: str) -> str:
     raise XValidationError(f"Invalid post ID or URL: {post_id_or_url}")
 
 
-# FIX #E2.1 (per Natasha): Strict ISO 8601 timestamp validation helper
+# FIX #E2.1 (per Natasha): Strict RFC 3339 / ISO 8601 UTC timestamp validation helper
 def validate_iso_timestamp(param_name: str, ts_str: str) -> str:
-    """Validate that timestamp string conforms to ISO 8601."""
+    """Validate that timestamp string conforms to RFC 3339 / ISO 8601 with timezone."""
     cleaned = ts_str.strip()
     if not cleaned:
         raise XValidationError(f"Timestamp '{param_name}' cannot be empty.")
     try:
-        datetime.fromisoformat(cleaned)
+        dt = datetime.fromisoformat(cleaned)
+        # RFC 3339 requires time and timezone offset (e.g. 'Z' or '+00:00')
+        if dt.tzinfo is None:
+            raise ValueError("Missing timezone offset")
+        if "T" not in cleaned and " " not in cleaned:
+            raise ValueError("Date-only strings not allowed for X API RFC 3339 timestamps")
         return cleaned
     except ValueError as e:
         raise XValidationError(
-            f"Invalid '{param_name}' timestamp format: '{ts_str}'. Expected ISO 8601 (e.g. '2026-01-01T00:00:00Z')."
+            f"Invalid '{param_name}' timestamp format: '{ts_str}'. Expected RFC 3339 with timezone (e.g. '2026-01-01T00:00:00Z')."
         ) from e
+
+
+def validate_time_range(start_time: str | None, end_time: str | None) -> None:
+    """Validate that start_time is chronologically before end_time."""
+    if start_time and end_time:
+        st_dt = datetime.fromisoformat(start_time)
+        et_dt = datetime.fromisoformat(end_time)
+        if st_dt >= et_dt:
+            raise XValidationError(
+                f"Invalid time range: start_time ('{start_time}') must be earlier than end_time ('{end_time}')."
+            )
 
 
 class XClient:
@@ -128,13 +145,22 @@ class XClient:
         self._timeout = timeout
         self._max_retries = max_retries
         self._backoff_base = backoff_base
-        self._last_rate_limit = RateLimitStatus()
+        # FIX #E1.1 (per Marcus): Track rate limits per endpoint category
+        self._rate_limits: dict[str, RateLimitStatus] = {}
+
+        # FIX #H4.1 (per Tyler): Pre-cached static base headers
+        self._headers = {
+            "Authorization": f"Bearer {self._bearer_token}",
+            "User-Agent": "x-search-tool/0.2.0",
+            "Accept": "application/json",
+        }
 
         # FIX #E4.1 & #H4.1 (per Maya & Tyler): Persistent connection pool & client reuse
         self._external_client = http_client
         self._internal_client: httpx.AsyncClient | None = None
-        # FIX #H1.1 (per Kyle): Lock is initialized lazily to avoid event-loop binding hazards
+        # FIX #H1.1 (per Kyle): Event-loop-bound lock reference
         self._client_lock: asyncio.Lock | None = None
+        self._lock_loop: asyncio.AbstractEventLoop | None = None
 
     @property
     def bearer_token(self) -> str:
@@ -153,10 +179,15 @@ class XClient:
     def __str__(self) -> str:
         return self.__repr__()
 
-    # FIX #H1.1 (per Kyle): Lazy event loop lock initialization
+    # FIX #H1.1 (per Kyle): Event loop lock affinity checking
     def _get_lock(self) -> asyncio.Lock:
-        if self._client_lock is None:
+        try:
+            curr_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            curr_loop = None
+        if self._client_lock is None or self._lock_loop is not curr_loop:
             self._client_lock = asyncio.Lock()
+            self._lock_loop = curr_loop
         return self._client_lock
 
     async def _get_http_client(self) -> httpx.AsyncClient:
@@ -191,19 +222,21 @@ class XClient:
         await self.aclose()
 
     def _get_headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self._bearer_token}",
-            "User-Agent": "x-search-tool/0.2.0",
-            "Accept": "application/json",
-        }
+        return self._headers
 
-    # FIX #E4.2 (per Maya): Uses RateLimitStatus.from_headers with Retry-After support
-    def _update_rate_limit(self, headers: httpx.Headers) -> None:
-        self._last_rate_limit = RateLimitStatus.from_headers(headers)
+    # FIX #E1.1 & #E4.2 (per Marcus & Maya): Per-endpoint rate limit status with Retry-After support
+    def _update_rate_limit(self, endpoint_key: str, headers: httpx.Headers) -> None:
+        status = RateLimitStatus.from_headers(headers)
+        self._rate_limits[endpoint_key] = status
+        self._rate_limits["_last"] = status
 
-    def get_rate_limit_status(self) -> RateLimitStatus:
-        """Returns the most recent rate limit status."""
-        return self._last_rate_limit
+    def get_rate_limit_status(self, endpoint_key: str = "search") -> RateLimitStatus:
+        """Returns the rate limit status for a specific endpoint category or most recent."""
+        return (
+            self._rate_limits.get(endpoint_key)
+            or self._rate_limits.get("_last")
+            or RateLimitStatus()
+        )
 
     def _parse_error_response(self, response: httpx.Response) -> str:
         try:
@@ -221,9 +254,23 @@ class XClient:
         except (ValueError, KeyError):
             return response.text or f"HTTP {response.status_code}"
 
-    # FIX #E4.2 & #E3.1 (per Maya & Raj): Exponential backoff with jitter for transient 5xx, timeouts & dropped sockets
+    # FIX #E4.1 (per Maya): Extract Retry-After seconds from response headers
+    def _extract_retry_after(self, headers: httpx.Headers) -> float | None:
+        retry_after = headers.get("retry-after")
+        if not retry_after:
+            return None
+        stripped = retry_after.strip()
+        if stripped.isdigit():
+            return float(stripped)
+        return None
+
+    # FIX #E4.1, #E4.2 & #E3.1 (per Maya & Raj): Exponential backoff with jitter and Retry-After header respect
     async def _send_request(
-        self, method: str, url: str, params: dict[str, Any] | None = None
+        self,
+        method: str,
+        url: str,
+        params: dict[str, Any] | None = None,
+        endpoint_key: str = "search",
     ) -> dict[str, Any]:
         client = await self._get_http_client()
         headers = self._get_headers()
@@ -232,16 +279,20 @@ class XClient:
         while True:
             try:
                 res = await client.request(method, url, headers=headers, params=params)
-                self._update_rate_limit(res.headers)
+                self._update_rate_limit(endpoint_key, res.headers)
 
                 # Retry on transient server errors (500, 502, 503, 504)
                 if res.status_code in (500, 502, 503, 504) and attempt < self._max_retries:
                     attempt += 1
-                    sleep_time = (self._backoff_base * (2**attempt)) + random.uniform(0.01, 0.05)
+                    retry_after = self._extract_retry_after(res.headers)
+                    if retry_after is not None:
+                        sleep_time = min(retry_after, 60.0) + random.uniform(0.01, 0.05)
+                    else:
+                        sleep_time = (self._backoff_base * (2**attempt)) + random.uniform(0.01, 0.05)
                     await asyncio.sleep(sleep_time)
                     continue
 
-                return self._handle_response(res)
+                return self._handle_response(res, endpoint_key=endpoint_key)
 
             except (httpx.ConnectError, httpx.TimeoutException, httpx.ProtocolError) as e:
                 if attempt < self._max_retries:
@@ -253,7 +304,7 @@ class XClient:
             except httpx.RequestError as e:
                 raise XAPIError(f"Network error communicating with X API: {e}") from e
 
-    def _handle_response(self, res: httpx.Response) -> dict[str, Any]:
+    def _handle_response(self, res: httpx.Response, endpoint_key: str = "search") -> dict[str, Any]:
         if res.status_code == 200:
             return res.json()
 
@@ -263,7 +314,7 @@ class XClient:
         if res.status_code == 429:
             raise XRateLimitError(
                 f"Rate limit exceeded (429): {error_msg}",
-                rate_limit=self._last_rate_limit,
+                rate_limit=self.get_rate_limit_status(endpoint_key),
             )
         raise XAPIError(f"X API Error ({res.status_code}): {error_msg}")
 
@@ -333,6 +384,11 @@ class XClient:
             raise XValidationError(
                 f"Search query exceeds X API limit of 512 characters (length: {len(clean_query)})."
             )
+        # FIX #H3.1 (per Karen): Strict validation for sort_order
+        if sort_order not in _ALLOWED_SORT_ORDERS:
+            raise XValidationError(
+                f"Invalid sort_order '{sort_order}'. Must be one of: {sorted(_ALLOWED_SORT_ORDERS)}"
+            )
 
         clamped_max = max(10, min(max_results, 100))
         params: dict[str, Any] = {
@@ -347,7 +403,7 @@ class XClient:
             params["next_token"] = next_token.strip()
 
         url = f"{self.BASE_URL}/tweets/search/recent"
-        payload = await self._send_request("GET", url, params=params)
+        payload = await self._send_request("GET", url, params=params, endpoint_key="search")
 
         users_map = self._parse_users(payload)
         posts: list[Post] = []
@@ -375,7 +431,7 @@ class XClient:
             "user.fields": "username,name,verified,profile_image_url",
         }
         url = f"{self.BASE_URL}/tweets/{post_id}"
-        payload = await self._send_request("GET", url, params=params)
+        payload = await self._send_request("GET", url, params=params, endpoint_key="tweets")
 
         data = payload.get("data")
         if not data or not isinstance(data, dict):
@@ -401,6 +457,11 @@ class XClient:
             raise XValidationError(
                 f"Search query exceeds full-archive limit of 1024 characters (length: {len(clean_query)})."
             )
+        # FIX #H3.1 (per Karen): Strict validation for sort_order
+        if sort_order not in _ALLOWED_SORT_ORDERS:
+            raise XValidationError(
+                f"Invalid sort_order '{sort_order}'. Must be one of: {sorted(_ALLOWED_SORT_ORDERS)}"
+            )
 
         clamped_max = max(10, min(max_results, 500))
         params: dict[str, Any] = {
@@ -411,15 +472,22 @@ class XClient:
             "user.fields": "username,name,verified,profile_image_url",
             "sort_order": sort_order,
         }
+        validated_start = None
+        validated_end = None
         if start_time and start_time.strip():
-            params["start_time"] = validate_iso_timestamp("start_time", start_time)
+            validated_start = validate_iso_timestamp("start_time", start_time)
+            params["start_time"] = validated_start
         if end_time and end_time.strip():
-            params["end_time"] = validate_iso_timestamp("end_time", end_time)
+            validated_end = validate_iso_timestamp("end_time", end_time)
+            params["end_time"] = validated_end
+        # FIX #E3.1 & #E2.1 (per Raj & Natasha): Fail fast on inverted time ranges
+        validate_time_range(validated_start, validated_end)
+
         if next_token and next_token.strip():
             params["next_token"] = next_token.strip()
 
         url = f"{self.BASE_URL}/tweets/search/all"
-        payload = await self._send_request("GET", url, params=params)
+        payload = await self._send_request("GET", url, params=params, endpoint_key="search_all")
 
         users_map = self._parse_users(payload)
         posts: list[Post] = []
@@ -451,7 +519,8 @@ class XClient:
         clean_query = query.strip()
         if not clean_query:
             raise XValidationError("Query cannot be empty.")
-        if granularity not in ("day", "hour", "minute"):
+        clean_granularity = granularity.strip().lower()
+        if clean_granularity not in ("day", "hour", "minute"):
             raise XValidationError(
                 f"Invalid granularity: '{granularity}'. Must be 'day', 'hour', or 'minute'."
             )
@@ -460,16 +529,23 @@ class XClient:
         url = f"{self.BASE_URL}/tweets/counts/{endpoint}"
         params: dict[str, Any] = {
             "query": clean_query,
-            "granularity": granularity,
+            "granularity": clean_granularity,
         }
+        validated_start = None
+        validated_end = None
         if start_time and start_time.strip():
-            params["start_time"] = validate_iso_timestamp("start_time", start_time)
+            validated_start = validate_iso_timestamp("start_time", start_time)
+            params["start_time"] = validated_start
         if end_time and end_time.strip():
-            params["end_time"] = validate_iso_timestamp("end_time", end_time)
+            validated_end = validate_iso_timestamp("end_time", end_time)
+            params["end_time"] = validated_end
+        # FIX #E3.1 & #E2.1 (per Raj & Natasha): Fail fast on inverted time ranges
+        validate_time_range(validated_start, validated_end)
+
         if next_token and next_token.strip():
             params["next_token"] = next_token.strip()
 
-        payload = await self._send_request("GET", url, params=params)
+        payload = await self._send_request("GET", url, params=params, endpoint_key="counts")
 
         buckets: list[CountBucket] = []
         raw_data = payload.get("data")

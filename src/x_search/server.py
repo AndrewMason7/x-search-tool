@@ -223,22 +223,37 @@ async def get_post(post_id_or_url: str) -> str:
     return format_post(post)
 
 
+# FIX #E1.1 (per Marcus): Scope rate limits per endpoint category to prevent bucket collision
 @mcp.tool()
 @mcp_error_boundary
-async def check_rate_limits() -> str:
-    """Check the remaining request quota and reset time for the X API search endpoint."""
+async def check_rate_limits(endpoint: str = "search") -> str:
+    """Check the remaining request quota and reset time for X API endpoints.
+
+    Args:
+        endpoint: Endpoint category to inspect: 'search' (recent search), 'search_all' (full archive),
+                  'tweets' (post lookup), or 'counts' (post volume). Default is 'search'.
+    """
     client = get_client()
-    status = client.get_rate_limit_status()
+    clean_endpoint = endpoint.strip().lower()
+    status = client.get_rate_limit_status(clean_endpoint)
+    category_name = {
+        "search": "Recent Search",
+        "search_all": "Full-Archive Search",
+        "tweets": "Tweet Lookup",
+        "counts": "Post Volume Counts",
+    }.get(clean_endpoint, clean_endpoint.capitalize())
+
     if status.limit is None:
         return (
-            "### Rate Limit Status\n\n"
-            "No requests have been executed yet in this session. "
-            "Rate limit headers will be populated upon the first API call."
+            f"### X {category_name} Rate Limit Status\n\n"
+            f"No requests have been executed yet for the '{clean_endpoint}' endpoint in this session. "
+            "Rate limit headers will be populated upon the first API call to this endpoint."
         )
 
     reset_str = status.reset_at.strftime("%Y-%m-%d %H:%M:%S UTC") if status.reset_at else "Unknown"
     return (
-        "### X Search API Rate Limit Status\n\n"
+        f"### X {category_name} Rate Limit Status\n\n"
+        f"- **Endpoint:** `{clean_endpoint}`\n"
         f"- **Remaining Quota:** {status.remaining} / {status.limit} requests\n"
         f"- **Resets At:** {reset_str}\n"
         f"- **Countdown:** ~{status.reset_seconds} seconds\n"

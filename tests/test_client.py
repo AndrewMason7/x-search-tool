@@ -12,6 +12,9 @@ from x_search.client import (
     XCredentialsError,
     XRateLimitError,
     XValidationError,
+    extract_post_id,
+    validate_iso_timestamp,
+    validate_time_range,
 )
 
 
@@ -251,6 +254,7 @@ async def test_search_recent_nullable_fields():
         assert res.result_count == 1
 
 
+# FIX #E3.1 & #Tyler.1 (per Raj & Tyler): sub-millisecond backoff eliminates 1.3s sleep delay in test
 @pytest.mark.asyncio
 async def test_search_recent_network_error():
     def handler(request: httpx.Request) -> httpx.Response:
@@ -258,7 +262,11 @@ async def test_search_recent_network_error():
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport) as http_client:
-        client = XClient(bearer_token="test_token", http_client=http_client)
+        client = XClient(
+            bearer_token="test_token",
+            http_client=http_client,
+            backoff_base=0.0001,
+        )
         with pytest.raises(XAPIError, match="Network error"):
             await client.search_recent(query="test")
 
@@ -460,8 +468,6 @@ async def test_get_counts_null_meta_total_tweet_count():
 
 
 def test_validate_iso_timestamp_valid_and_invalid():
-    from x_search.client import validate_iso_timestamp
-
     assert validate_iso_timestamp("start_time", "2026-01-01T00:00:00Z") == "2026-01-01T00:00:00Z"
     assert (
         validate_iso_timestamp("start_time", "2026-10-03T12:00:00+00:00")
@@ -502,8 +508,109 @@ async def test_client_transient_retry_remote_protocol_error(
             bearer_token="test_token",
             http_client=http_client,
             max_retries=2,
-            backoff_base=0.01,
+            backoff_base=0.0001,
         )
         post = await client.get_post("1840000000000000001")
         assert calls == 2
         assert post.id == "1840000000000000001"
+
+
+def test_validate_iso_timestamp_rfc3339_strictness():
+    # Valid with UTC 'Z' or offset
+    assert validate_iso_timestamp("start_time", "2026-01-01T00:00:00Z") == "2026-01-01T00:00:00Z"
+    assert (
+        validate_iso_timestamp("start_time", "2026-01-01T00:00:00+00:00")
+        == "2026-01-01T00:00:00+00:00"
+    )
+
+    # Date-only string must fail
+    with pytest.raises(XValidationError, match="Expected RFC 3339 with timezone"):
+        validate_iso_timestamp("start_time", "2026-01-01")
+
+    # Naive timestamp without timezone must fail
+    with pytest.raises(XValidationError, match="Expected RFC 3339 with timezone"):
+        validate_iso_timestamp("start_time", "2026-01-01T12:00:00")
+
+
+def test_validate_time_range_bounds():
+    # Valid chronological order
+    validate_time_range("2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z")
+
+    # Inverted order raises validation error
+    with pytest.raises(XValidationError, match="must be earlier than end_time"):
+        validate_time_range("2026-02-01T00:00:00Z", "2026-01-01T00:00:00Z")
+
+    # Equal timestamps raise validation error
+    with pytest.raises(XValidationError, match="must be earlier than end_time"):
+        validate_time_range("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+
+
+def test_extract_post_id_boundary_and_length():
+    # Valid bounded IDs
+    assert extract_post_id("https://x.com/user/status/1840000000000000001") == "1840000000000000001"
+    assert (
+        extract_post_id("https://x.com/user/status/1840000000000000001?s=20")
+        == "1840000000000000001"
+    )
+
+    # Overly long numeric ID (> 30 digits) rejected
+    with pytest.raises(XValidationError, match="Invalid post ID or URL"):
+        extract_post_id("https://x.com/user/status/" + "9" * 35)
+
+    # Trailing alpha garbage in URL path rejected
+    with pytest.raises(XValidationError, match="Invalid post ID or URL"):
+        extract_post_id("https://x.com/user/status/1840000000000000001bad")
+
+
+@pytest.mark.asyncio
+async def test_sort_order_validation():
+    async with httpx.AsyncClient() as http_client:
+        client = XClient(bearer_token="test_token", http_client=http_client)
+        with pytest.raises(XValidationError, match="Invalid sort_order"):
+            await client.search_recent(query="test", sort_order="invalid_order")
+
+        with pytest.raises(XValidationError, match="Invalid sort_order"):
+            await client.search_all(query="test", sort_order="random_order")
+
+
+@pytest.mark.asyncio
+async def test_retry_after_on_transient_503(sample_single_post_json: dict[str, Any]):
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(503, headers={"retry-after": "0"})
+        return httpx.Response(200, json=sample_single_post_json)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = XClient(
+            bearer_token="test_token",
+            http_client=http_client,
+            max_retries=2,
+            backoff_base=0.0001,
+        )
+        post = await client.get_post("1840000000000000001")
+        assert calls == 2
+        assert post.id == "1840000000000000001"
+
+
+# FIX #E2.1 (per Natasha): Unicode, RTL, and emoji queries handling
+@pytest.mark.asyncio
+async def test_search_recent_unicode_and_emojis(sample_search_json: dict[str, Any]):
+    captured_query = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured_query
+        captured_query = str(request.url)
+        return httpx.Response(200, json=sample_search_json)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = XClient(bearer_token="test_token", http_client=http_client)
+        res = await client.search_recent(query="🚀 #AI 日本語 🐍")
+        assert len(res.posts) == 2
+        assert "%F0%9F%9A%80" in captured_query or "🚀" in captured_query
+

@@ -29,8 +29,9 @@ The `x-search` MCP server provides five primary tools:
 4. `get_post(post_id_or_url: str) -> str`
    - Fetches full details for a specific post using either a numeric status ID (e.g. `1840000000000000001`) or a link (`https://x.com/username/status/...` or `https://twitter.com/...`).
 
-5. `check_rate_limits() -> str`
-   - Returns the remaining request quota, reset timestamp, and countdown for the X API endpoint.
+5. `check_rate_limits(endpoint: str = "search") -> str`
+   - Returns the remaining request quota, reset timestamp, and countdown for X API endpoints.
+   - `endpoint`: `'search'` (recent search), `'search_all'` (full archive), `'tweets'` (post lookup), or `'counts'` (post volume). Defaults to `'search'`.
 
 ---
 

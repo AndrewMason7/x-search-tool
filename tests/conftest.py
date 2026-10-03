@@ -1,8 +1,58 @@
-"""Shared test fixtures and sample API v2 responses."""
+"""Shared test fixtures, isolation hooks, and sample API v2 responses."""
 
+from collections.abc import AsyncGenerator, Callable
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
+
+from x_search.client import XClient
+
+
+# FIX #E1.1 (per Marcus): Hermetic test isolation resetting singleton client state between tests
+@pytest.fixture(autouse=True)
+def reset_server_singleton() -> Any:
+    """Ensure x_search.server._client_instance is reset before and after each test."""
+    import x_search.server as server_mod
+
+    server_mod._client_instance = None
+    yield
+    server_mod._client_instance = None
+
+
+# FIX #E3.1 & #E5.1 (per Raj & Tom): High-performance client factory with zero-delay backoff
+@pytest.fixture
+def make_test_client() -> Callable[..., XClient]:
+    """Factory fixture returning an XClient configured with zero-delay retries for fast testing."""
+
+    def _factory(
+        handler: Callable[[httpx.Request], httpx.Response] | None = None,
+        bearer_token: str = "test_token",
+        max_retries: int = 2,
+        backoff_base: float = 0.0001,  # Sub-millisecond backoff prevents test sleep thrashing
+        timeout: float = 5.0,
+    ) -> XClient:
+        transport = httpx.MockTransport(handler) if handler else None
+        http_client = httpx.AsyncClient(transport=transport) if transport else None
+        return XClient(
+            bearer_token=bearer_token,
+            http_client=http_client,
+            max_retries=max_retries,
+            backoff_base=backoff_base,
+            timeout=timeout,
+        )
+
+    return _factory
+
+
+# FIX #H2.1 (per Jake): DRY mock server client fixture eliminating repetitive patch boilerplate
+@pytest.fixture
+def mock_server_client() -> AsyncGenerator[AsyncMock, None]:
+    """Provides a mocked XClient pre-injected into x_search.server.get_client."""
+    mock_client = AsyncMock(spec=XClient)
+    with patch("x_search.server.get_client", return_value=mock_client):
+        yield mock_client
 
 
 @pytest.fixture
