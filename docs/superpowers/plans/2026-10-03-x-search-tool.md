@@ -129,7 +129,7 @@ Configures the MCP server using `uv run`:
   "mcpServers": {
     "x-search": {
       "command": "uv",
-      "args": ["run", "--directory", "/Users/andrew/Documents/GitHub/x-search-tool", "x-search"]
+      "args": ["run", "x-search"]
     }
   }
 }

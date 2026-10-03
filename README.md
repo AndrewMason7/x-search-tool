@@ -46,9 +46,12 @@ uv sync
 ## Usage as an Antigravity Plugin
 
 To install this tool directly into Antigravity:
-1. Symlink or copy the repository directory to `~/.gemini/config/plugins/x-search`:
+1. Copy or symlink the repository directory to `~/.gemini/config/plugins/x-search`:
    ```bash
-   ln -s /Users/andrew/Documents/GitHub/x-search-tool ~/.gemini/config/plugins/x-search
+   # From the repository root:
+   cp -R . ~/.gemini/config/plugins/x-search
+   # Or create a symbolic link:
+   ln -s "$(pwd)" ~/.gemini/config/plugins/x-search
    ```
 2. Restart Antigravity or reload plugins. The `x-search` skill and tools will be available automatically to all agents.
 
@@ -66,7 +69,7 @@ Add the following entry to your `mcp.json` or `mcp_config.json`:
       "args": [
         "run",
         "--directory",
-        "/Users/andrew/Documents/GitHub/x-search-tool",
+        "/path/to/x-search-tool",
         "x-search"
       ],
       "env": {
