@@ -114,6 +114,7 @@ Searches posts from the last 7 days.
 - `query` (str): Search query with optional boolean operators (e.g., `"deepseek" lang:en -is:retweet`).
 - `max_results` (int, optional): Number of posts to return (10 to 100, default: 10).
 - `next_token` (str, optional): Pagination token for loading subsequent pages.
+- `sort_order` (str, optional): `'recency'` or `'relevancy'` (default: `'recency'`).
 
 ### `search_full_archive_posts`
 Searches historical posts from March 2006 to present (requires Pro/Academic API tier).

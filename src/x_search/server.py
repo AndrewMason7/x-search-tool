@@ -1,7 +1,7 @@
-"""FastMCP server exposing tools for searching X (Twitter) and inspecting posts."""
-
 import functools
-from collections.abc import Callable, Coroutine
+import logging
+from collections.abc import AsyncIterator, Callable, Coroutine
+from contextlib import asynccontextmanager
 from typing import Any
 
 try:
@@ -19,9 +19,25 @@ from x_search.client import (
 )
 from x_search.models import Post, PostCountsResponse, SearchResponse
 
+logger = logging.getLogger("x_search.server")
+
+
+@asynccontextmanager
+async def server_lifespan(server: Any) -> AsyncIterator[None]:
+    """Lifespan context manager that cleanly closes the httpx client on shutdown."""
+    logger.info("Initializing x-search MCP server...")
+    yield
+    global _client_instance
+    if _client_instance is not None:
+        logger.info("Closing x-search HTTP client session...")
+        await _client_instance.aclose()
+        _client_instance = None
+
+
 mcp = MCPServer(
     "x-search",
     description="X (Twitter) recent search, full-archive search, post lookup, and rate limit suite",
+    lifespan=server_lifespan,
 )
 
 _client_instance: XClient | None = None
@@ -58,10 +74,13 @@ def mcp_error_boundary(
             try:
                 return await f(*args, **kwargs)
             except XCredentialsError:
+                logger.warning("X credentials error encountered: credentials not configured.")
                 return CREDENTIALS_HELP
             except XValidationError as e:
+                logger.warning("Input validation error in %s: %s", f.__name__, e)
                 return f"### Invalid Input\n\n{e}"
             except XRateLimitError as e:
+                logger.warning("X rate limit exceeded in %s: %s", f.__name__, e)
                 countdown = (
                     f"\n\n**Countdown to Reset:** ~{e.rate_limit.reset_seconds} seconds"
                     if e.rate_limit and e.rate_limit.reset_seconds is not None
@@ -72,14 +91,17 @@ def mcp_error_boundary(
                     "Please wait until the rate limit window resets before querying again."
                 )
             except XAPIAuthError as e:
+                logger.error("X API authentication failure in %s: %s", f.__name__, e)
                 hint = (
                     auth_help
                     or "Please verify that your X Bearer Token is valid and has search permissions."
                 )
                 return f"### Authentication Failure\n\n{e}\n{hint}"
             except XAPIError as e:
+                logger.error("X API error in %s: %s", f.__name__, e)
                 return f"### X API Error\n\n{e}"
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
+                logger.exception("Unexpected error executing MCP tool %s", f.__name__)
                 return f"### Unexpected Error\n\n{e}"
 
         return wrapper
@@ -173,12 +195,21 @@ def format_post_counts(res: PostCountsResponse, query: str, full_archive: bool) 
     return "\n".join(out)
 
 
+STANDARD_QUOTAS: dict[str, str] = {
+    "search": "450 app / 180 user requests per 15-minute window",
+    "search_all": "300 requests per 15-minute window (Pro/Archive tier)",
+    "tweets": "900 requests per 15-minute window",
+    "counts": "300 requests per 15-minute window",
+}
+
+
 @mcp.tool()
 @mcp_error_boundary
 async def search_recent_posts(
     query: str,
     max_results: int = 10,
     next_token: str | None = None,
+    sort_order: str = "recency",
 ) -> str:
     """Search recent posts (last 7 days) on X (Twitter).
 
@@ -197,12 +228,14 @@ async def search_recent_posts(
         query: The search query string with optional operators.
         max_results: Number of posts to retrieve (10 to 100, default 10).
         next_token: Optional pagination token from a previous search.
+        sort_order: 'recency' or 'relevancy' (default 'recency').
     """
     client = get_client()
     res = await client.search_recent(
         query=query,
         max_results=max_results,
         next_token=next_token,
+        sort_order=sort_order,
     )
     return format_search_response(res, scope_label="recent")
 
@@ -241,10 +274,14 @@ async def check_rate_limits(endpoint: str = "search") -> str:
     }.get(clean_endpoint, clean_endpoint.capitalize())
 
     if status.limit is None:
+        ref_quota = STANDARD_QUOTAS.get(
+            clean_endpoint, "Varies by subscription tier (per 15-minute window)"
+        )
         return (
             f"### X {category_name} Rate Limit Status\n\n"
-            f"No requests have been executed yet for the '{clean_endpoint}' endpoint in this session. "
-            "Rate limit headers will be populated upon the first API call to this endpoint."
+            f"No requests have been executed yet for `{clean_endpoint}` in this session.\n\n"
+            f"- **Reference Standard Quota:** {ref_quota}\n"
+            "- **Live Tracking:** Exact remaining quota and reset countdown will be populated upon your first API call to this endpoint."
         )
 
     reset_str = status.reset_at.strftime("%Y-%m-%d %H:%M:%S UTC") if status.reset_at else "Unknown"

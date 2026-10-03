@@ -11,8 +11,9 @@ Use this skill when searching X (Twitter) for recent discussions, historical arc
 
 The `x-search` MCP server provides five primary tools:
 
-1. `search_recent_posts(query: str, max_results: int = 10, next_token: str | None = None) -> str`
+1. `search_recent_posts(query: str, max_results: int = 10, next_token: str | None = None, sort_order: str = "recency") -> str`
    - Searches posts published within the last 7 days.
+   - Supports `'recency'` or `'relevancy'` sort order.
    - Returns hydrated author details, publication timestamps, engagement metrics (likes, reposts, replies, views), and post URLs.
 
 2. `search_full_archive_posts(query: str, start_time: str | None = None, end_time: str | None = None, max_results: int = 10, next_token: str | None = None, sort_order: str = "recency") -> str`

@@ -5,10 +5,12 @@
       "args": [
         "run",
         "--directory",
-        ".",
+        "/path/to/x-search-tool",
         "x-search"
       ],
-      "env": {}
+      "env": {
+        "X_BEARER_TOKEN": "YOUR_BEARER_TOKEN"
+      }
     }
   }
 }

@@ -1,6 +1,5 @@
-"""HTTP client for interacting with the X (Twitter) API v2."""
-
 import asyncio
+import logging
 import os
 import random
 import re
@@ -11,6 +10,8 @@ from urllib.parse import urlparse
 
 import httpx
 from dotenv import find_dotenv, load_dotenv
+
+logger = logging.getLogger("x_search.client")
 
 from x_search.models import (
     Author,
@@ -197,6 +198,7 @@ class XClient:
         """Close managed network resources."""
         async with self._get_lock():
             if self._internal_client and not self._internal_client.is_closed:
+                logger.debug("Closing persistent HTTP client connection pool")
                 await self._internal_client.aclose()
                 self._internal_client = None
 
@@ -216,8 +218,18 @@ class XClient:
 
     def _update_rate_limit(self, endpoint_key: str, headers: httpx.Headers) -> None:
         status = RateLimitStatus.from_headers(headers)
-        self._rate_limits[endpoint_key] = status
+        # Prevent unbounded map growth by confining to recognized endpoint categories
+        known_keys = {"search", "search_all", "tweets", "counts"}
+        key = endpoint_key if endpoint_key in known_keys else "search"
+        self._rate_limits[key] = status
         self._rate_limits["_last"] = status
+        logger.debug(
+            "Rate limit updated for %s: %s/%s remaining (resets in %ss)",
+            key,
+            status.remaining,
+            status.limit,
+            status.reset_seconds,
+        )
 
     def get_rate_limit_status(self, endpoint_key: str = "search") -> RateLimitStatus:
         """Returns the rate limit status for a specific endpoint category or most recent."""
@@ -265,6 +277,13 @@ class XClient:
         attempt = 0
         while True:
             try:
+                logger.debug(
+                    "Sending HTTP %s request to %s (endpoint=%s, attempt=%d)",
+                    method,
+                    url,
+                    endpoint_key,
+                    attempt + 1,
+                )
                 res = await client.request(method, url, headers=headers, params=params)
                 self._update_rate_limit(endpoint_key, res.headers)
 
@@ -278,6 +297,13 @@ class XClient:
                         sleep_time = (self._backoff_base * (2**attempt)) + random.uniform(
                             0.01, 0.05
                         )
+                    logger.warning(
+                        "Transient HTTP %d from X API; retrying in %.2fs (attempt %d/%d)",
+                        res.status_code,
+                        sleep_time,
+                        attempt,
+                        self._max_retries,
+                    )
                     await asyncio.sleep(sleep_time)
                     continue
 
@@ -287,10 +313,19 @@ class XClient:
                 if attempt < self._max_retries:
                     attempt += 1
                     sleep_time = (self._backoff_base * (2**attempt)) + random.uniform(0.01, 0.05)
+                    logger.warning(
+                        "Transient network error (%s); retrying in %.2fs (attempt %d/%d)",
+                        type(e).__name__,
+                        sleep_time,
+                        attempt,
+                        self._max_retries,
+                    )
                     await asyncio.sleep(sleep_time)
                     continue
+                logger.error("Network failure communicating with X API: %s", e)
                 raise XAPIError(f"Network error communicating with X API: {e}") from e
             except httpx.RequestError as e:
+                logger.error("HTTP request error communicating with X API: %s", e)
                 raise XAPIError(f"Network error communicating with X API: {e}") from e
 
     def _handle_response(self, res: httpx.Response, endpoint_key: str = "search") -> dict[str, Any]:

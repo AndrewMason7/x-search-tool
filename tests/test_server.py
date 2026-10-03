@@ -227,3 +227,57 @@ async def test_check_rate_limits_endpoint_scoping(mock_server_client: AsyncMock)
     assert "850 / 900" in output
     assert "**Endpoint:** `tweets`" in output
     mock_server_client.get_rate_limit_status.assert_called_with("tweets")
+
+
+@pytest.mark.asyncio
+async def test_search_recent_posts_sort_order(mock_server_client: AsyncMock):
+    mock_resp = SearchResponse(posts=[], result_count=0)
+    mock_server_client.search_recent.return_value = mock_resp
+
+    await search_recent_posts("test query", sort_order="relevancy")
+    mock_server_client.search_recent.assert_called_once_with(
+        query="test query",
+        max_results=10,
+        next_token=None,
+        sort_order="relevancy",
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_rate_limits_seeded_default(mock_server_client: AsyncMock):
+    mock_server_client.get_rate_limit_status.return_value = RateLimitStatus(
+        limit=None, remaining=None, reset_at=None
+    )
+    output = await check_rate_limits("search")
+    assert "No requests have been executed yet for `search`" in output
+    assert "Reference Standard Quota" in output
+    assert "450 app / 180 user requests" in output
+
+
+@pytest.mark.asyncio
+async def test_server_lifespan_closes_client():
+    from x_search import server
+
+    mock_client = AsyncMock()
+    server._client_instance = mock_client
+    async with server.server_lifespan(server.mcp):
+        assert server._client_instance is mock_client
+
+    assert server._client_instance is None
+    mock_client.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_mcp_error_boundary_logs_exception():
+    from x_search.server import logger, mcp_error_boundary
+
+    @mcp_error_boundary
+    async def bad_tool():
+        raise TypeError("Unexpected type error!")
+
+    with patch.object(logger, "exception") as mock_log:
+        output = await bad_tool()
+        assert "Unexpected Error" in output
+        assert "Unexpected type error!" in output
+        mock_log.assert_called_once()
+        assert "bad_tool" in mock_log.call_args[0][1]
