@@ -1,5 +1,9 @@
 # X (Twitter) Search Tool & MCP Server
 
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
 An asynchronous Model Context Protocol (MCP) server and Antigravity plugin for searching recent and historical posts on X (Twitter), analyzing tweet volume trends, inspecting engagement metrics, looking up individual posts, and managing rate limits via the X API v2.
 
 ---
@@ -11,9 +15,9 @@ An asynchronous Model Context Protocol (MCP) server and Antigravity plugin for s
 - **Post Counts API:** Retrieve time-series post volume trends and aggregate counts grouped by `day`, `hour`, or `minute` for recent or full-archive data.
 - **Hydrated Data:** Automatic resolution of author handles, verified badges, profile pictures, and engagement metrics (likes, reposts, replies, views).
 - **Post Lookup:** Fetch single posts using either numeric status IDs or full URLs (`https://x.com/...` or `https://twitter.com/...`).
-- **Rate Limit Tracking:** Real-time quota tracking (`x-rate-limit-remaining`, `x-rate-limit-reset`) with actionable countdowns.
+- **Rate Limit Tracking:** Real-time quota tracking (`x-rate-limit-remaining`, `x-rate-limit-reset`) with actionable countdowns and per-endpoint isolation.
 - **FastMCP & stdio:** Built on the official Python MCP SDK with stdio transport.
-- **Agent Skill & Antigravity Plugin:** Bundled with `plugin.json`, `mcp_config.json`, and `skills/x-search/SKILL.md` for instant agent adoption.
+- **Agent Skill & Antigravity Plugin:** Bundled with `plugin.json`, `mcp_config.json`, and `skills/x-search/SKILL.md` for seamless agent workflows.
 
 ---
 
@@ -43,23 +47,44 @@ uv sync
 
 ---
 
-## Usage as an Antigravity Plugin
+## Antigravity Plugin Installation
 
-To install this tool directly into Antigravity:
-1. Copy or symlink the repository directory to `~/.gemini/config/plugins/x-search`:
-   ```bash
-   # From the repository root:
-   cp -R . ~/.gemini/config/plugins/x-search
-   # Or create a symbolic link:
-   ln -s "$(pwd)" ~/.gemini/config/plugins/x-search
-   ```
-2. Restart Antigravity or reload plugins. The `x-search` skill and tools will be available automatically to all agents.
+Install the plugin directly into Antigravity using the `agy` CLI:
+
+```bash
+# From within the repository directory:
+agy plugin install .
+
+# Or specify the directory path:
+agy plugin install /path/to/x-search-tool
+```
+
+### Verification & Management
+```bash
+# Validate plugin structure (skills, MCP servers, manifests)
+agy plugin validate .
+
+# List installed plugins
+agy plugin list
+
+# Enable or disable
+agy plugin enable x-search
+agy plugin disable x-search
+```
+
+Once installed, the `x-search` skill and MCP server are automatically active for all Antigravity agent sessions.
 
 ---
 
 ## Usage with Other MCP Hosts (Claude Code, Cursor, Windsurf)
 
-Add the following entry to your `mcp.json` or `mcp_config.json`:
+### Claude Code CLI
+```bash
+claude mcp add x-search uv -- run --directory /path/to/x-search-tool x-search
+```
+
+### MCP Configuration File (`mcp.json` / `mcp_config.json`)
+Add the following entry to your MCP configuration:
 
 ```json
 {
@@ -91,7 +116,7 @@ Searches posts from the last 7 days.
 - `next_token` (str, optional): Pagination token for loading subsequent pages.
 
 ### `search_full_archive_posts`
-Searches historical posts from March 2006 to present.
+Searches historical posts from March 2006 to present (requires Pro/Academic API tier).
 - `query` (str): Search query string (up to 1024 characters).
 - `start_time` (str, optional): Oldest UTC timestamp in ISO 8601 format (`2020-01-01T00:00:00Z`).
 - `end_time` (str, optional): Most recent UTC timestamp in ISO 8601 format.
@@ -109,16 +134,17 @@ Analyzes tweet volume trends without fetching individual posts.
 
 ### `get_post`
 Retrieves detailed information for a single post.
-- `post_id_or_url` (str): Numeric status ID or full status URL.
+- `post_id_or_url` (str): Numeric status ID (e.g., `'1840000000000000001'`) or full status URL (`'https://x.com/user/status/1840000000000000001'`).
 
 ### `check_rate_limits`
 Returns remaining API requests and countdown seconds until rate limit reset.
+- `endpoint` (str, optional): Endpoint category to inspect: `'search'` (recent search, default), `'search_all'` (full archive), `'tweets'` (post lookup), or `'counts'` (post volume counts).
 
 ---
 
 ## Testing & Quality
 
-Run the automated test suite:
+Run the automated test suite (68 tests):
 ```bash
 uv run pytest -v
 ```
@@ -128,3 +154,9 @@ Run code formatting and linting:
 uv run ruff check .
 uv run ruff format --check .
 ```
+
+---
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
