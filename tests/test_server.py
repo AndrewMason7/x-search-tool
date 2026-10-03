@@ -283,15 +283,83 @@ async def test_mcp_error_boundary_logs_exception():
         assert "bad_tool" in mock_log.call_args[0][1]
 
 
-def test_configure_logging_env_override():
+def test_configure_logging_scopes_to_x_search_package():
+    """X_SEARCH_LOG_LEVEL must lift only x_search, never third-party loggers.
+
+    Regression guard: a root-level DEBUG config previously un-corked
+    httpcore/httpx/asyncio/mcp DEBUG logging into the MCP host's stderr.
+    """
+    import logging
+    import sys
+
+    from x_search.server import configure_logging
+
+    pkg = logging.getLogger("x_search")
+    root = logging.getLogger()
+    saved = (pkg.level, pkg.propagate, list(pkg.handlers), root.level)
+    try:
+        for name in ("x_search", "httpcore", "httpx", "asyncio", "mcp"):
+            logging.getLogger(name).setLevel(logging.NOTSET)
+        for handler in list(pkg.handlers):
+            pkg.removeHandler(handler)
+        root.setLevel(logging.WARNING)
+
+        with patch.dict("os.environ", {"X_SEARCH_LOG_LEVEL": "DEBUG"}):
+            configure_logging()
+
+        assert pkg.level == logging.DEBUG
+        assert pkg.propagate is False, "must not double-log via the root handler"
+        streams = [
+            handler.stream for handler in pkg.handlers if isinstance(handler, logging.StreamHandler)
+        ]
+        assert streams == [sys.stderr], "x_search logs must be stderr-anchored"
+
+        # The firehose guard: third-party loggers stay at the WARNING root level.
+        for noisy in ("httpcore", "httpx", "asyncio", "mcp"):
+            assert logging.getLogger(noisy).isEnabledFor(logging.DEBUG) is False, noisy
+    finally:
+        pkg.setLevel(saved[0])
+        pkg.propagate = saved[1]
+        for handler in list(pkg.handlers):
+            pkg.removeHandler(handler)
+        for handler in saved[2]:
+            pkg.addHandler(handler)
+        root.setLevel(saved[3])
+
+
+def test_configure_logging_does_not_stack_handlers():
+    """Repeated calls must be idempotent -- no duplicated log lines."""
     import logging
 
     from x_search.server import configure_logging
 
-    with patch.dict("os.environ", {"X_SEARCH_LOG_LEVEL": "DEBUG"}):
-        configure_logging()
-        assert logging.getLogger("x_search").level == logging.DEBUG
+    pkg = logging.getLogger("x_search")
+    saved_handlers = list(pkg.handlers)
+    saved_level = pkg.level
+    try:
+        for handler in list(pkg.handlers):
+            pkg.removeHandler(handler)
+        for _ in range(3):
+            configure_logging()
+        assert len(pkg.handlers) == 1
+    finally:
+        for handler in list(pkg.handlers):
+            pkg.removeHandler(handler)
+        for handler in saved_handlers:
+            pkg.addHandler(handler)
+        pkg.setLevel(saved_level)
 
-    with patch.dict("os.environ", {"X_SEARCH_LOG_LEVEL": "WARNING"}):
-        configure_logging()
-        assert logging.getLogger("x_search").level == logging.WARNING
+
+def test_configure_logging_unknown_level_falls_back_to_info():
+    import logging
+
+    from x_search.server import configure_logging
+
+    pkg = logging.getLogger("x_search")
+    saved_level = pkg.level
+    try:
+        with patch.dict("os.environ", {"X_SEARCH_LOG_LEVEL": "NOT_A_LEVEL"}):
+            configure_logging()
+        assert pkg.level == logging.INFO
+    finally:
+        pkg.setLevel(saved_level)
