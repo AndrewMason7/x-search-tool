@@ -3,6 +3,7 @@
   "displayName": "X (Twitter) Search Tool",
   "description": "Search recent and historical posts on X (Twitter) back to 2006, analyze tweet volume trends, inspect engagement metrics, and lookup posts by ID or URL via X API v2.",
   "version": "0.2.0",
+  "logo": "assets/logo.png",
   "suggestedPrompts": [
     "Search historical X posts from 2015 about early deep learning",
     "Analyze tweet volume trend for Python over the past 7 days",
