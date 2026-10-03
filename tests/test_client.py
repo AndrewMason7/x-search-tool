@@ -611,4 +611,3 @@ async def test_search_recent_unicode_and_emojis(sample_search_json: dict[str, An
         res = await client.search_recent(query="🚀 #AI 日本語 🐍")
         assert len(res.posts) == 2
         assert "%F0%9F%9A%80" in captured_query or "🚀" in captured_query
-

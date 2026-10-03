@@ -78,8 +78,6 @@ def test_search_response_model():
     assert res.next_token == "token_abc"
 
 
-
-
 def test_rate_limit_status():
     future = datetime.now(UTC) + timedelta(seconds=900)
     status = RateLimitStatus(limit=180, remaining=179, reset_at=future)

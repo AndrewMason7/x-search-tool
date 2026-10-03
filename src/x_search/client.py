@@ -275,7 +275,9 @@ class XClient:
                     if retry_after is not None:
                         sleep_time = min(retry_after, 60.0) + random.uniform(0.01, 0.05)
                     else:
-                        sleep_time = (self._backoff_base * (2**attempt)) + random.uniform(0.01, 0.05)
+                        sleep_time = (self._backoff_base * (2**attempt)) + random.uniform(
+                            0.01, 0.05
+                        )
                     await asyncio.sleep(sleep_time)
                     continue
 
