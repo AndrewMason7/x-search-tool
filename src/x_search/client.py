@@ -1,9 +1,13 @@
 """HTTP client for interacting with the X (Twitter) API v2."""
 
+import asyncio
 import os
+import random
 import re
 from datetime import UTC, datetime
-from typing import Any
+from types import TracebackType
+from typing import Any, Self
+from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -49,24 +53,43 @@ class XRateLimitError(XSearchError):
         self.rate_limit = rate_limit
 
 
+# FIX #E3.1 & #E2.2 (per Raj & Natasha): Pre-compiled regexes & length-bounded extraction
+_POST_URL_PATTERN = re.compile(r"(?:^|/)status(?:es)?/(\d+)")
+_NUMERIC_ID_PATTERN = re.compile(r"^\d{1,30}$")
+_MAX_POST_INPUT_LEN = 512
+_ALLOWED_DOMAINS = {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}
+
+
 def extract_post_id(post_id_or_url: str) -> str:
     """Extract numeric post ID from a raw ID or an X/Twitter URL."""
     cleaned = post_id_or_url.strip().strip("<>\"'")
-
-    # Match URL pattern like https://x.com/user/status/1234567890 or /statuses/
-    match = re.search(r"status(?:es)?/(\d+)", cleaned)
-    if match:
-        return match.group(1)
+    if not cleaned or len(cleaned) > _MAX_POST_INPUT_LEN:
+        raise XValidationError(f"Invalid post ID or URL: {post_id_or_url}")
 
     # Match pure numeric string
-    if re.fullmatch(r"\d+", cleaned):
+    if _NUMERIC_ID_PATTERN.fullmatch(cleaned):
         return cleaned
+
+    # Match URL pattern with domain verification
+    try:
+        parsed = urlparse(cleaned if "://" in cleaned else f"https://{cleaned}")
+        domain = (parsed.hostname or "").lower()
+        if domain and domain not in _ALLOWED_DOMAINS:
+            raise XValidationError(f"Invalid post ID or URL: untrusted domain '{domain}'")
+
+        match = _POST_URL_PATTERN.search(parsed.path)
+        if match:
+            return match.group(1)
+    except Exception as err:
+        if isinstance(err, XValidationError):
+            raise
+        raise XValidationError(f"Invalid post ID or URL: {post_id_or_url}") from err
 
     raise XValidationError(f"Invalid post ID or URL: {post_id_or_url}")
 
 
 class XClient:
-    """Client for X API v2 recent search and post endpoints."""
+    """Client for X API v2 recent search, full-archive search, counts, and post endpoints."""
 
     BASE_URL = "https://api.x.com/2"
 
@@ -74,6 +97,9 @@ class XClient:
         self,
         bearer_token: str | None = None,
         http_client: httpx.AsyncClient | None = None,
+        timeout: float = 15.0,
+        max_retries: int = 2,
+        backoff_base: float = 0.2,
     ) -> None:
         token = (
             bearer_token or os.getenv("X_BEARER_TOKEN") or os.getenv("TWITTER_BEARER_TOKEN") or ""
@@ -83,14 +109,69 @@ class XClient:
                 "X_BEARER_TOKEN or TWITTER_BEARER_TOKEN environment variable not set. "
                 "Please configure your X Bearer Token."
             )
-        self.bearer_token = token
-        self._external_client = http_client
+        self._bearer_token = token
+        self._timeout = timeout
+        self._max_retries = max_retries
+        self._backoff_base = backoff_base
         self._last_rate_limit = RateLimitStatus()
+
+        # FIX #E4.1 & #H4.1 (per Maya & Tyler): Persistent connection pool & client reuse
+        self._external_client = http_client
+        self._internal_client: httpx.AsyncClient | None = None
+        self._client_lock = asyncio.Lock()
+
+    @property
+    def bearer_token(self) -> str:
+        """Returns the configured Bearer Token."""
+        return self._bearer_token
+
+    # FIX #E2.1 (per Natasha): Redact bearer token in string & repr representations
+    def __repr__(self) -> str:
+        masked = (
+            f"{self._bearer_token[:4]}...{self._bearer_token[-4:]}"
+            if len(self._bearer_token) > 8
+            else "****"
+        )
+        return f"<XClient base_url={self.BASE_URL!r} token={masked!r}>"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+    async def _get_http_client(self) -> httpx.AsyncClient:
+        """Returns the shared connection-pooled HTTP client."""
+        if self._external_client:
+            return self._external_client
+        if self._internal_client is None or self._internal_client.is_closed:
+            async with self._client_lock:
+                if self._internal_client is None or self._internal_client.is_closed:
+                    self._internal_client = httpx.AsyncClient(
+                        timeout=self._timeout,
+                        limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+                    )
+        return self._internal_client
+
+    async def aclose(self) -> None:
+        """Close managed network resources."""
+        async with self._client_lock:
+            if self._internal_client and not self._internal_client.is_closed:
+                await self._internal_client.aclose()
+                self._internal_client = None
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        await self.aclose()
 
     def _get_headers(self) -> dict[str, str]:
         return {
-            "Authorization": f"Bearer {self.bearer_token}",
-            "User-Agent": "x-search-tool/0.1.0",
+            "Authorization": f"Bearer {self._bearer_token}",
+            "User-Agent": "x-search-tool/0.2.0",
             "Accept": "application/json",
         }
 
@@ -132,6 +213,52 @@ class XClient:
             return response.text
         except (ValueError, KeyError):
             return response.text or f"HTTP {response.status_code}"
+
+    # FIX #E4.2 (per Maya): Exponential backoff with jitter for transient 5xx & network drops
+    async def _send_request(
+        self, method: str, url: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        client = await self._get_http_client()
+        headers = self._get_headers()
+
+        attempt = 0
+        while True:
+            try:
+                res = await client.request(method, url, headers=headers, params=params)
+                self._update_rate_limit(res.headers)
+
+                # Retry on transient server errors (500, 502, 503, 504)
+                if res.status_code in (500, 502, 503, 504) and attempt < self._max_retries:
+                    attempt += 1
+                    sleep_time = (self._backoff_base * (2**attempt)) + random.uniform(0.01, 0.05)
+                    await asyncio.sleep(sleep_time)
+                    continue
+
+                return self._handle_response(res)
+
+            except (httpx.ConnectError, httpx.TimeoutException) as e:
+                if attempt < self._max_retries:
+                    attempt += 1
+                    sleep_time = (self._backoff_base * (2**attempt)) + random.uniform(0.01, 0.05)
+                    await asyncio.sleep(sleep_time)
+                    continue
+                raise XAPIError(f"Network error communicating with X API: {e}") from e
+            except httpx.RequestError as e:
+                raise XAPIError(f"Network error communicating with X API: {e}") from e
+
+    def _handle_response(self, res: httpx.Response) -> dict[str, Any]:
+        if res.status_code == 200:
+            return res.json()
+
+        error_msg = self._parse_error_response(res)
+        if res.status_code in (401, 403):
+            raise XAPIAuthError(f"Unauthorized ({res.status_code}): {error_msg}")
+        if res.status_code == 429:
+            raise XRateLimitError(
+                f"Rate limit exceeded (429): {error_msg}",
+                rate_limit=self._last_rate_limit,
+            )
+        raise XAPIError(f"X API Error ({res.status_code}): {error_msg}")
 
     def _parse_users(self, data: dict[str, Any]) -> dict[str, Author]:
         users_map: dict[str, Author] = {}
@@ -183,39 +310,6 @@ class XClient:
             metrics=metrics,
             edit_history_tweet_ids=item.get("edit_history_tweet_ids", []),
         )
-
-    async def _send_request(
-        self, method: str, url: str, params: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        headers = self._get_headers()
-        try:
-            if self._external_client:
-                res = await self._external_client.request(
-                    method, url, headers=headers, params=params
-                )
-                self._update_rate_limit(res.headers)
-                return self._handle_response(res)
-
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                res = await client.request(method, url, headers=headers, params=params)
-                self._update_rate_limit(res.headers)
-                return self._handle_response(res)
-        except httpx.RequestError as e:
-            raise XAPIError(f"Network error communicating with X API: {e}") from e
-
-    def _handle_response(self, res: httpx.Response) -> dict[str, Any]:
-        if res.status_code == 200:
-            return res.json()
-
-        error_msg = self._parse_error_response(res)
-        if res.status_code in (401, 403):
-            raise XAPIAuthError(f"Unauthorized ({res.status_code}): {error_msg}")
-        if res.status_code == 429:
-            raise XRateLimitError(
-                f"Rate limit exceeded (429): {error_msg}",
-                rate_limit=self._last_rate_limit,
-            )
-        raise XAPIError(f"X API Error ({res.status_code}): {error_msg}")
 
     async def search_recent(
         self,

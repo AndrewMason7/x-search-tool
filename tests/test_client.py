@@ -370,3 +370,71 @@ async def test_get_counts_invalid_granularity():
         client = XClient(bearer_token="test_token", http_client=http_client)
         with pytest.raises(XValidationError, match="Invalid granularity"):
             await client.get_counts(query="python", granularity="month")
+
+
+def test_client_repr_masks_token():
+    client = XClient(bearer_token="AAAAAAAAAAAAAAAAAAAAAMLArwAAAAAAgExampleSecretToken123456789")
+    repr_str = repr(client)
+    str_str = str(client)
+    assert "AAAA...6789" in repr_str
+    assert "gExampleSecretToken" not in repr_str
+    assert "gExampleSecretToken" not in str_str
+
+
+def test_extract_post_id_untrusted_domain():
+    from x_search.client import extract_post_id
+
+    with pytest.raises(XValidationError, match="untrusted domain"):
+        extract_post_id("https://phishing-site.ru/user/status/9876543210")
+
+
+def test_extract_post_id_too_long():
+    from x_search.client import extract_post_id
+
+    with pytest.raises(XValidationError, match="Invalid post ID or URL"):
+        extract_post_id("1" * 600)
+
+
+@pytest.mark.asyncio
+async def test_client_persistent_pooling():
+    client = XClient(bearer_token="test_token")
+    try:
+        http1 = await client._get_http_client()
+        http2 = await client._get_http_client()
+        assert http1 is http2
+        assert not http1.is_closed
+    finally:
+        await client.aclose()
+        assert http1.is_closed
+
+
+@pytest.mark.asyncio
+async def test_client_context_manager():
+    async with XClient(bearer_token="test_token") as client:
+        http = await client._get_http_client()
+        assert not http.is_closed
+    assert http.is_closed
+
+
+@pytest.mark.asyncio
+async def test_client_transient_retry_success(sample_single_post_json: dict[str, Any]):
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(503, text="Service Unavailable")
+        return httpx.Response(200, json=sample_single_post_json)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = XClient(
+            bearer_token="test_token",
+            http_client=http_client,
+            max_retries=2,
+            backoff_base=0.01,
+        )
+        post = await client.get_post("1840000000000000001")
+        assert calls == 2
+        assert post.id == "1840000000000000001"

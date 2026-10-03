@@ -1,6 +1,6 @@
 """Domain models for X (Twitter) search and posts."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field
 
@@ -53,9 +53,6 @@ class SearchResponse(BaseModel):
     next_token: str | None = None
 
 
-from datetime import UTC, datetime
-
-
 class RateLimitStatus(BaseModel):
     """Rate limit headers snapshot."""
 
@@ -65,11 +62,13 @@ class RateLimitStatus(BaseModel):
 
     @property
     def reset_seconds(self) -> int | None:
-        """Dynamically computes the remaining seconds until reset."""
+        """Dynamically computes the remaining seconds until reset safely."""
         if not self.reset_at:
             return None
+        # FIX #E4.3 (per Maya): Normalizes naive vs aware datetimes to UTC before subtraction
+        reset_target = self.reset_at.astimezone(UTC)
         now = datetime.now(UTC)
-        diff = (self.reset_at - now).total_seconds()
+        diff = (reset_target - now).total_seconds()
         return max(0, int(diff))
 
 

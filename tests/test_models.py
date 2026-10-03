@@ -80,6 +80,14 @@ def test_rate_limit_status():
     assert 895 <= status.reset_seconds <= 900
 
 
+def test_rate_limit_status_naive_datetime():
+    naive_future = datetime.now() + timedelta(seconds=600)  # noqa: DTZ005
+    status = RateLimitStatus(limit=100, remaining=50, reset_at=naive_future)
+    # Must not raise TypeError when subtracting
+    assert status.reset_seconds is not None
+    assert 590 <= status.reset_seconds <= 605
+
+
 def test_post_counts_models():
     from x_search.models import CountBucket, PostCountsResponse
 
