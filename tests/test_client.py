@@ -261,3 +261,112 @@ async def test_search_recent_network_error():
         client = XClient(bearer_token="test_token", http_client=http_client)
         with pytest.raises(XAPIError, match="Network error"):
             await client.search_recent(query="test")
+
+
+@pytest.mark.asyncio
+async def test_search_all_success(sample_search_json: dict[str, Any]):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/2/tweets/search/all"
+        assert "start_time=2020-01-01T00%3A00%3A00Z" in str(request.url)
+        assert "end_time=2020-12-31T23%3A59%3A59Z" in str(request.url)
+        assert "max_results=200" in str(request.url)
+        return httpx.Response(200, json=sample_search_json)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = XClient(bearer_token="test_token", http_client=http_client)
+        res = await client.search_all(
+            query="python",
+            start_time="2020-01-01T00:00:00Z",
+            end_time="2020-12-31T23:59:59Z",
+            max_results=200,
+        )
+        assert len(res.posts) == 2
+        assert res.posts[0].author is not None
+
+
+@pytest.mark.asyncio
+async def test_search_all_clamps_max_results(sample_search_json: dict[str, Any]):
+    captured: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(str(request.url))
+        return httpx.Response(200, json=sample_search_json)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = XClient(bearer_token="test_token", http_client=http_client)
+        await client.search_all(query="python", max_results=5)
+        assert "max_results=10" in captured[0]
+
+        await client.search_all(query="python", max_results=800)
+        assert "max_results=500" in captured[1]
+
+
+@pytest.mark.asyncio
+async def test_search_all_query_length_limit():
+    async with httpx.AsyncClient() as http_client:
+        client = XClient(bearer_token="test_token", http_client=http_client)
+        too_long = "python " * 150  # > 1024 chars
+        with pytest.raises(XValidationError, match="1024 characters"):
+            await client.search_all(query=too_long)
+
+
+@pytest.mark.asyncio
+async def test_get_counts_recent_success():
+    payload = {
+        "data": [
+            {
+                "end": "2026-10-02T00:00:00.000Z",
+                "start": "2026-10-01T00:00:00.000Z",
+                "tweet_count": 520,
+            }
+        ],
+        "meta": {"total_tweet_count": 520},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/2/tweets/counts/recent"
+        assert "granularity=day" in str(request.url)
+        return httpx.Response(200, json=payload)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = XClient(bearer_token="test_token", http_client=http_client)
+        counts = await client.get_counts(query="python", granularity="day")
+        assert counts.total_count == 520
+        assert counts.granularity == "day"
+        assert len(counts.buckets) == 1
+        assert counts.buckets[0].tweet_count == 520
+
+
+@pytest.mark.asyncio
+async def test_get_counts_full_archive_success():
+    payload = {
+        "data": [
+            {
+                "end": "2010-01-02T00:00:00.000Z",
+                "start": "2010-01-01T00:00:00.000Z",
+                "tweet_count": 42,
+            }
+        ],
+        "meta": {"total_tweet_count": 42},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/2/tweets/counts/all"
+        return httpx.Response(200, json=payload)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = XClient(bearer_token="test_token", http_client=http_client)
+        counts = await client.get_counts(query="python", full_archive=True)
+        assert counts.total_count == 42
+
+
+@pytest.mark.asyncio
+async def test_get_counts_invalid_granularity():
+    async with httpx.AsyncClient() as http_client:
+        client = XClient(bearer_token="test_token", http_client=http_client)
+        with pytest.raises(XValidationError, match="Invalid granularity"):
+            await client.get_counts(query="python", granularity="month")

@@ -71,3 +71,20 @@ class RateLimitStatus(BaseModel):
         now = datetime.now(UTC)
         diff = (self.reset_at - now).total_seconds()
         return max(0, int(diff))
+
+
+class CountBucket(BaseModel):
+    """Time-bucket post volume count."""
+
+    start: datetime
+    end: datetime
+    tweet_count: int
+
+
+class PostCountsResponse(BaseModel):
+    """Aggregated post counts volume timeseries."""
+
+    total_count: int = 0
+    granularity: str = "day"
+    buckets: list[CountBucket] = Field(default_factory=list)
+    next_token: str | None = None

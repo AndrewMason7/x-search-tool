@@ -13,7 +13,7 @@ from x_search.client import (
     XRateLimitError,
     XValidationError,
 )
-from x_search.models import Post, SearchResponse
+from x_search.models import Post, PostCountsResponse, SearchResponse
 
 mcp = MCPServer(
     "x-search",
@@ -212,3 +212,131 @@ async def check_rate_limits() -> str:
         return CREDENTIALS_HELP
     except Exception as e:  # noqa: BLE001
         return f"### Unable to check rate limits\n\n{e}"
+
+
+def format_post_counts(res: PostCountsResponse, query: str, full_archive: bool) -> str:
+    """Format post counts timeseries into markdown table."""
+    scope = "Full Archive (2006–Present)" if full_archive else "Recent (Last 7 Days)"
+    out = [
+        "### X Post Volume Counts\n",
+        f"- **Query:** `{query}`",
+        f"- **Total Posts:** {res.total_count:,}",
+        f"- **Granularity:** {res.granularity}",
+        f"- **Scope:** {scope}\n",
+    ]
+    if not res.buckets:
+        out.append("No bucket counts returned for the specified window.")
+        return "\n".join(out)
+
+    out.append("| Start Time (UTC) | End Time (UTC) | Post Count |")
+    out.append("| :--- | :--- | :--- |")
+    for b in res.buckets:
+        start_str = b.start.strftime("%Y-%m-%d %H:%M:%S")
+        end_str = b.end.strftime("%Y-%m-%d %H:%M:%S")
+        out.append(f"| {start_str} | {end_str} | {b.tweet_count:,} |")
+
+    return "\n".join(out)
+
+
+@mcp.tool()
+async def search_full_archive_posts(
+    query: str,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    max_results: int = 10,
+    next_token: str | None = None,
+    sort_order: str = "recency",
+) -> str:
+    """Search the complete historical archive of posts on X (Twitter) from March 2006 to present.
+
+    Note: Requires an X API account tier with full-archive search access.
+
+    Args:
+        query: Search query string (up to 1024 characters). Supports boolean operators.
+        start_time: Oldest UTC timestamp in ISO 8601 format (e.g. '2020-01-01T00:00:00Z').
+        end_time: Most recent UTC timestamp in ISO 8601 format (e.g. '2020-12-31T23:59:59Z').
+        max_results: Posts per page (10 to 500, default 10).
+        next_token: Pagination token from previous search result.
+        sort_order: 'recency' or 'relevancy' (default 'recency').
+    """
+    try:
+        client = get_client()
+        res = await client.search_all(
+            query=query,
+            start_time=start_time,
+            end_time=end_time,
+            max_results=max_results,
+            next_token=next_token,
+            sort_order=sort_order,
+        )
+        return format_search_response(res)
+    except XCredentialsError:
+        return CREDENTIALS_HELP
+    except XValidationError as e:
+        return f"### Invalid Input\n\n{e}"
+    except XRateLimitError as e:
+        countdown = (
+            f"\n\n**Countdown to Reset:** ~{e.rate_limit.reset_seconds} seconds"
+            if e.rate_limit and e.rate_limit.reset_seconds is not None
+            else ""
+        )
+        return (
+            f"### Rate Limit Exceeded\n\n{e}{countdown}\n"
+            "Please wait until the rate limit window resets before querying again."
+        )
+    except XAPIAuthError as e:
+        return (
+            f"### Authentication Failure\n\n{e}\n"
+            "Full-archive search requires an X developer account tier with archive access."
+        )
+    except XAPIError as e:
+        return f"### X API Error\n\n{e}"
+    except Exception as e:  # noqa: BLE001
+        return f"### Unexpected Error\n\nFailed to complete full archive search: {e}"
+
+
+@mcp.tool()
+async def get_post_counts(
+    query: str,
+    granularity: str = "day",
+    start_time: str | None = None,
+    end_time: str | None = None,
+    full_archive: bool = False,
+) -> str:
+    """Analyze post volume and trend counts on X without fetching individual posts.
+
+    Args:
+        query: Search query to count matching posts.
+        granularity: Time bucket grouping: 'day', 'hour', or 'minute' (default: 'day').
+        start_time: Oldest UTC timestamp in ISO 8601 format (e.g. '2026-09-01T00:00:00Z').
+        end_time: Most recent UTC timestamp in ISO 8601 format.
+        full_archive: Set to True for historical counts back to 2006 (requires archive access).
+                      Default False queries the last 7 days.
+    """
+    try:
+        client = get_client()
+        res = await client.get_counts(
+            query=query,
+            granularity=granularity,
+            start_time=start_time,
+            end_time=end_time,
+            full_archive=full_archive,
+        )
+        return format_post_counts(res, query=query, full_archive=full_archive)
+    except XCredentialsError:
+        return CREDENTIALS_HELP
+    except XValidationError as e:
+        return f"### Invalid Input\n\n{e}"
+    except XRateLimitError as e:
+        countdown = (
+            f"\n\n**Countdown to Reset:** ~{e.rate_limit.reset_seconds} seconds"
+            if e.rate_limit and e.rate_limit.reset_seconds is not None
+            else ""
+        )
+        return f"### Rate Limit Exceeded\n\n{e}{countdown}"
+    except XAPIAuthError as e:
+        return f"### Authentication Failure\n\n{e}"
+    except XAPIError as e:
+        return f"### Counts Query Failed\n\n{e}"
+    except Exception as e:  # noqa: BLE001
+        return f"### Unexpected Error\n\n{e}"

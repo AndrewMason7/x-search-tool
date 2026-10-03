@@ -8,7 +8,15 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
-from x_search.models import Author, Post, PublicMetrics, RateLimitStatus, SearchResponse
+from x_search.models import (
+    Author,
+    CountBucket,
+    Post,
+    PostCountsResponse,
+    PublicMetrics,
+    RateLimitStatus,
+    SearchResponse,
+)
 
 load_dotenv()
 
@@ -274,3 +282,117 @@ class XClient:
 
         users_map = self._parse_users(payload)
         return self._parse_post(data, users_map)
+
+    async def search_all(
+        self,
+        query: str,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        max_results: int = 10,
+        next_token: str | None = None,
+        sort_order: str = "recency",
+    ) -> SearchResponse:
+        """Search full historical post archive (2006 to present) on X."""
+        clean_query = query.strip()
+        if not clean_query:
+            raise XValidationError("Search query cannot be empty.")
+        if len(clean_query) > 1024:
+            raise XValidationError(
+                f"Search query exceeds full-archive limit of 1024 characters (length: {len(clean_query)})."
+            )
+
+        clamped_max = max(10, min(max_results, 500))
+        params: dict[str, Any] = {
+            "query": clean_query,
+            "max_results": clamped_max,
+            "tweet.fields": "created_at,public_metrics,author_id,edit_history_tweet_ids",
+            "expansions": "author_id",
+            "user.fields": "username,name,verified,profile_image_url",
+            "sort_order": sort_order,
+        }
+        if start_time and start_time.strip():
+            params["start_time"] = start_time.strip()
+        if end_time and end_time.strip():
+            params["end_time"] = end_time.strip()
+        if next_token and next_token.strip():
+            params["next_token"] = next_token.strip()
+
+        url = f"{self.BASE_URL}/tweets/search/all"
+        payload = await self._send_request("GET", url, params=params)
+
+        users_map = self._parse_users(payload)
+        posts: list[Post] = []
+        raw_posts = payload.get("data")
+        if isinstance(raw_posts, list):
+            for item in raw_posts:
+                if isinstance(item, dict) and "id" in item:
+                    posts.append(self._parse_post(item, users_map))
+
+        meta = payload.get("meta") or {}
+        return SearchResponse(
+            posts=posts,
+            result_count=meta.get("result_count", len(posts)),
+            newest_id=meta.get("newest_id"),
+            oldest_id=meta.get("oldest_id"),
+            next_token=meta.get("next_token"),
+        )
+
+    async def get_counts(
+        self,
+        query: str,
+        granularity: str = "day",
+        start_time: str | None = None,
+        end_time: str | None = None,
+        full_archive: bool = False,
+        next_token: str | None = None,
+    ) -> PostCountsResponse:
+        """Get post volume counts grouped by day, hour, or minute."""
+        clean_query = query.strip()
+        if not clean_query:
+            raise XValidationError("Query cannot be empty.")
+        if granularity not in ("day", "hour", "minute"):
+            raise XValidationError(
+                f"Invalid granularity: '{granularity}'. Must be 'day', 'hour', or 'minute'."
+            )
+
+        endpoint = "all" if full_archive else "recent"
+        url = f"{self.BASE_URL}/tweets/counts/{endpoint}"
+        params: dict[str, Any] = {
+            "query": clean_query,
+            "granularity": granularity,
+        }
+        if start_time and start_time.strip():
+            params["start_time"] = start_time.strip()
+        if end_time and end_time.strip():
+            params["end_time"] = end_time.strip()
+        if next_token and next_token.strip():
+            params["next_token"] = next_token.strip()
+
+        payload = await self._send_request("GET", url, params=params)
+
+        buckets: list[CountBucket] = []
+        raw_data = payload.get("data")
+        if isinstance(raw_data, list):
+            for b in raw_data:
+                if isinstance(b, dict) and "start" in b and "end" in b:
+                    try:
+                        start_dt = datetime.fromisoformat(b["start"])
+                        end_dt = datetime.fromisoformat(b["end"])
+                        buckets.append(
+                            CountBucket(
+                                start=start_dt,
+                                end=end_dt,
+                                tweet_count=int(b.get("tweet_count", 0)),
+                            )
+                        )
+                    except (ValueError, TypeError):
+                        continue
+
+        meta = payload.get("meta") or {}
+        total_count = int(meta.get("total_tweet_count", sum(b.tweet_count for b in buckets)))
+        return PostCountsResponse(
+            total_count=total_count,
+            granularity=granularity,
+            buckets=buckets,
+            next_token=meta.get("next_token"),
+        )

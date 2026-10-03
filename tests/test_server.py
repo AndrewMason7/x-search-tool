@@ -166,3 +166,46 @@ async def test_check_rate_limits_tool():
         output = await check_rate_limits()
         assert "150 / 180" in output
         assert "Countdown:" in output
+
+
+@pytest.mark.asyncio
+async def test_search_full_archive_posts_tool_success():
+    from x_search.server import search_full_archive_posts
+
+    author = Author(id="123", username="historical", name="Old Account")
+    post = Post(id="1", text="Historic tweet from 2007", author=author)
+    mock_resp = SearchResponse(posts=[post], result_count=1)
+
+    with patch("x_search.server.get_client") as mock_get_client:
+        mock_client = AsyncMock()
+        mock_client.search_all.return_value = mock_resp
+        mock_get_client.return_value = mock_client
+
+        output = await search_full_archive_posts("Historic", max_results=10)
+        assert "@historical" in output
+        assert "Historic tweet from 2007" in output
+
+
+@pytest.mark.asyncio
+async def test_get_post_counts_tool_success():
+    from x_search.models import CountBucket, PostCountsResponse
+    from x_search.server import get_post_counts
+
+    start = datetime(2026, 10, 1, 0, 0, 0, tzinfo=UTC)
+    end = datetime(2026, 10, 2, 0, 0, 0, tzinfo=UTC)
+    bucket = CountBucket(start=start, end=end, tweet_count=3500)
+    mock_counts = PostCountsResponse(
+        total_count=3500,
+        granularity="day",
+        buckets=[bucket],
+    )
+
+    with patch("x_search.server.get_client") as mock_get_client:
+        mock_client = AsyncMock()
+        mock_client.get_counts.return_value = mock_counts
+        mock_get_client.return_value = mock_client
+
+        output = await get_post_counts("python", granularity="day")
+        assert "3,500" in output
+        assert "Total Posts" in output
+        assert "2026-10-01" in output

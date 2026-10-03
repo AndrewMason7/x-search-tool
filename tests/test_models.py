@@ -78,3 +78,23 @@ def test_rate_limit_status():
     assert status.reset_at == future
     assert status.reset_seconds is not None
     assert 895 <= status.reset_seconds <= 900
+
+
+def test_post_counts_models():
+    from x_search.models import CountBucket, PostCountsResponse
+
+    start = datetime(2026, 10, 1, 0, 0, 0, tzinfo=UTC)
+    end = datetime(2026, 10, 2, 0, 0, 0, tzinfo=UTC)
+    bucket = CountBucket(start=start, end=end, tweet_count=1520)
+    assert bucket.tweet_count == 1520
+
+    resp = PostCountsResponse(
+        total_count=1520,
+        granularity="day",
+        buckets=[bucket],
+        next_token="token_count",
+    )
+    assert resp.total_count == 1520
+    assert resp.granularity == "day"
+    assert len(resp.buckets) == 1
+    assert resp.next_token == "token_count"

@@ -1,12 +1,14 @@
 # X (Twitter) Search Tool & MCP Server
 
-An asynchronous Model Context Protocol (MCP) server and Antigravity plugin for searching recent posts on X (Twitter), inspecting engagement metrics, looking up individual posts, and managing rate limits via the X API v2.
+An asynchronous Model Context Protocol (MCP) server and Antigravity plugin for searching recent and historical posts on X (Twitter), analyzing tweet volume trends, inspecting engagement metrics, looking up individual posts, and managing rate limits via the X API v2.
 
 ---
 
 ## Features
 
 - **Recent Search (v2):** Search posts from the last 7 days with rich operator support (`from:`, `to:`, `@mention`, `#hashtag`, `url:`, `lang:en`, `-is:retweet`, `-is:reply`, `has:media`).
+- **Full-Archive Search (v2):** Search all historical posts back to **March 2006** with UTC timestamp bounds (`start_time`, `end_time`) and up to 500 results per page.
+- **Post Counts API:** Retrieve time-series post volume trends and aggregate counts grouped by `day`, `hour`, or `minute` for recent or full-archive data.
 - **Hydrated Data:** Automatic resolution of author handles, verified badges, profile pictures, and engagement metrics (likes, reposts, replies, views).
 - **Post Lookup:** Fetch single posts using either numeric status IDs or full URLs (`https://x.com/...` or `https://twitter.com/...`).
 - **Rate Limit Tracking:** Real-time quota tracking (`x-rate-limit-remaining`, `x-rate-limit-reset`) with actionable countdowns.
@@ -84,6 +86,23 @@ Searches posts from the last 7 days.
 - `query` (str): Search query with optional boolean operators (e.g., `"deepseek" lang:en -is:retweet`).
 - `max_results` (int, optional): Number of posts to return (10 to 100, default: 10).
 - `next_token` (str, optional): Pagination token for loading subsequent pages.
+
+### `search_full_archive_posts`
+Searches historical posts from March 2006 to present.
+- `query` (str): Search query string (up to 1024 characters).
+- `start_time` (str, optional): Oldest UTC timestamp in ISO 8601 format (`2020-01-01T00:00:00Z`).
+- `end_time` (str, optional): Most recent UTC timestamp in ISO 8601 format.
+- `max_results` (int, optional): 10 to 500 (default: 10).
+- `next_token` (str, optional): Pagination token.
+- `sort_order` (str, optional): `'recency'` or `'relevancy'`.
+
+### `get_post_counts`
+Analyzes tweet volume trends without fetching individual posts.
+- `query` (str): Search query to count matching posts.
+- `granularity` (str, optional): `'day'`, `'hour'`, or `'minute'` (default: `'day'`).
+- `start_time` (str, optional): ISO 8601 UTC timestamp.
+- `end_time` (str, optional): ISO 8601 UTC timestamp.
+- `full_archive` (bool, optional): `True` for historical counts back to 2006; `False` for the last 7 days (default).
 
 ### `get_post`
 Retrieves detailed information for a single post.
