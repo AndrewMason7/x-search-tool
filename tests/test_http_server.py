@@ -8,12 +8,13 @@ configuration guards.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 
 import pytest
 from starlette.testclient import TestClient
 
-from x_search.http_server import HEALTH_PATH, build_asgi_app
+from x_search.http_server import HEALTH_PATH, AuthDebugMiddleware, build_asgi_app
 from x_search.server import mcp
 
 TOKEN = "test-bearer-token"
@@ -149,3 +150,56 @@ def test_none_bearer_token_disables_auth() -> None:
     app = build_asgi_app(mcp, bearer_token=None)
 
     assert app is not None
+
+
+async def test_auth_debug_middleware_redacts_secrets() -> None:
+    """The debug logger must reveal request shape without leaking credentials."""
+    captured: list[str] = []
+    handler = logging.Handler()
+    handler.emit = lambda record: captured.append(record.getMessage())  # type: ignore[method-assign]
+    debug_logger = logging.getLogger("x_search.http")
+    debug_logger.addHandler(handler)
+    previous_level = debug_logger.level
+    debug_logger.setLevel(logging.INFO)
+
+    sent: list[dict] = []
+
+    async def inner(scope, receive, send):  # type: ignore[no-untyped-def]
+        await receive()  # the replayed body must still be readable downstream
+        await send({"type": "http.response.start", "status": 400, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def receive():  # type: ignore[no-untyped-def]
+        return {
+            "type": "http.request",
+            "body": b"grant_type=authorization_code&client_id=abc&client_secret=top-secret",
+            "more_body": False,
+        }
+
+    async def send(message):  # type: ignore[no-untyped-def]
+        sent.append(message)
+
+    try:
+        middleware = AuthDebugMiddleware(inner)
+        await middleware(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/token",
+                "query_string": b"",
+                "headers": [(b"authorization", b"Basic YWJjOnNlY3JldA==")],
+            },
+            receive,
+            send,
+        )
+    finally:
+        debug_logger.removeHandler(handler)
+        debug_logger.setLevel(previous_level)
+
+    joined = " ".join(captured)
+    assert "top-secret" not in joined
+    assert "YWJjOnNlY3JldA==" not in joined
+    assert "client_secret" in joined and "<present>" in joined
+    assert "authorization_scheme" in joined and "Basic" in joined
+    assert "-> 400" in joined
+    assert sent and sent[0]["status"] == 400

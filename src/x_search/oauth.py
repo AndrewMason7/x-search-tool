@@ -326,7 +326,16 @@ class XSearchOAuthProvider(
         self._persist()
         logger.info("Issued authorization code for client %s", client.client_id)
 
-        return construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state)
+        # RFC 9207: include `iss` so a client can tell which authorization server
+        # answered and refuse a response that came from somewhere else. It must be
+        # byte-identical to the issuer advertised in our metadata, hence the
+        # round-trip through AnyHttpUrl (which normalises a bare origin).
+        return construct_redirect_uri(
+            str(params.redirect_uri),
+            code=code,
+            state=params.state,
+            iss=str(AnyHttpUrl(self._config.issuer_url)),
+        )
 
     async def load_authorization_code(
         self,

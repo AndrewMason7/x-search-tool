@@ -96,6 +96,7 @@ def _authorize(client: TestClient, challenge: str, state: str = "st-1") -> str:
     location = response.headers["location"]
     assert location.startswith(REDIRECT_URI)
     assert f"state={state}" in location
+    assert f"iss={ISSUER}" in location or "iss=https%3A%2F%2Fxsearch.example.test" in location
     return location.split("code=", 1)[1].split("&", 1)[0]
 
 

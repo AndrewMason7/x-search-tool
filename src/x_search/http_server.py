@@ -28,10 +28,12 @@ static check runs first and would reject OAuth-issued tokens).
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import parse_qs
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
@@ -60,6 +62,11 @@ def _header_value(scope: Scope, name: bytes) -> bytes | None:
         if key.lower() == name:
             return value
     return None
+
+
+def _env_flag(name: str) -> bool:
+    """Read a boolean-ish environment variable."""
+    return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class BearerAuthMiddleware:
@@ -105,6 +112,81 @@ class BearerAuthMiddleware:
             return
 
         await self.app(scope, receive, send)
+
+
+#: OAuth endpoints whose request shape is worth logging when debugging a client
+#: integration. Bodies are small and non-streaming, so buffering them is safe.
+DEBUGGED_AUTH_PATHS = frozenset({"/authorize", "/token", "/register"})
+_SECRET_FIELDS = ("client_secret", "code", "code_verifier", "refresh_token", "assertion")
+
+
+class AuthDebugMiddleware:
+    """Log the shape (never the values) of OAuth requests.
+
+    Enabled by ``X_SEARCH_DEBUG_AUTH=1``. Exists because a client that fails
+    "account linking" gives you nothing to work with: you cannot tell whether it
+    never called ``/token``, called it without a secret, or used HTTP Basic when
+    the registered client expects the secret in the body. This answers that in one
+    attempt. Secrets are recorded only as present/absent.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("path") not in DEBUGGED_AUTH_PATHS:
+            await self.app(scope, receive, send)
+            return
+
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                break
+            body.extend(message.get("body", b""))
+            if not message.get("more_body", False):
+                break
+
+        parsed = parse_qs(body.decode("utf-8", "replace"), keep_blank_values=True)
+        # GET /authorize carries everything in the query string, POST /token in the
+        # body; log both so one retry tells the whole story.
+        parsed.update(
+            parse_qs(
+                scope.get("query_string", b"").decode("utf-8", "replace"), keep_blank_values=True
+            )
+        )
+        auth_header = _header_value(scope, _HEADER_LOOKUP_KEY)
+        scheme = auth_header.split(b" ", 1)[0].decode() if auth_header else "none"
+
+        detail: dict[str, Any] = {
+            key: ("<present>" if key in _SECRET_FIELDS else value)
+            for key, values in parsed.items()
+            for value in ["|".join(values)]
+        }
+        detail["authorization_scheme"] = scheme
+        detail["has_client_secret_field"] = "client_secret" in parsed
+
+        status: int | None = None
+
+        async def capture_send(message: Any) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            await send(message)
+
+        logger.info("AUTH DEBUG %s %s %s", scope.get("method"), scope.get("path"), detail)
+
+        replayed = False
+
+        async def replay() -> Any:
+            nonlocal replayed
+            if replayed:
+                return {"type": "http.disconnect"}
+            replayed = True
+            return {"type": "http.request", "body": bytes(body), "more_body": False}
+
+        await self.app(scope, replay, capture_send)
+        logger.info("AUTH DEBUG %s %s -> %s", scope.get("method"), scope.get("path"), status)
 
 
 def _health_endpoint(server_name: str, transports: list[str]) -> Any:
@@ -256,6 +338,13 @@ def build_asgi_app(
 
     if bearer_token:
         app = BearerAuthMiddleware(app, bearer_token)
+
+    if _env_flag("X_SEARCH_DEBUG_AUTH"):
+        app = AuthDebugMiddleware(app)
+        logger.warning(
+            "OAuth request-shape logging is ON (X_SEARCH_DEBUG_AUTH); secret fields "
+            "are logged as <present> only"
+        )
 
     logger.info("Built x-search ASGI app: transports=%s", ", ".join(transports))
     return app
