@@ -8,9 +8,11 @@ JSON-RPC call — plus the failure modes that must stay closed.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import secrets
+import time
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -30,10 +32,12 @@ from x_search.server import server_lifespan
 ISSUER = "https://xsearch.example.test"
 CLIENT_ID = "test-client-id"
 CLIENT_SECRET = "test-client-secret"
+CONSENT_SECRET = "test-consent-secret"
 #: Spark completes the flow at Google's own callback origin, which is the only
 #: origin registrations are accepted from.
 REDIRECT_URI = "https://oauth-redirect.googleusercontent.com/r/spark-test"
 OFF_ORIGIN_REDIRECT_URI = "https://evil.example.test/cb"
+LOOPBACK_REDIRECT_URI = "http://127.0.0.1:9/cb"
 INITIALIZE = {
     "jsonrpc": "2.0",
     "id": 1,
@@ -62,6 +66,7 @@ def oauth_config(tmp_path: Path) -> OAuthConfig:
         client_id=CLIENT_ID,
         client_secret=CLIENT_SECRET,
         store_path=tmp_path / "oauth.json",
+        consent_secret=CONSENT_SECRET,
     )
 
 
@@ -78,32 +83,69 @@ def client(oauth_config: OAuthConfig, provider: XSearchOAuthProvider) -> Iterato
 
 def _client_for(config: OAuthConfig, provider: XSearchOAuthProvider | None = None) -> TestClient:
     """Build a TestClient around a fresh server for the given OAuth config."""
+    resolved = provider or XSearchOAuthProvider(config)
     server = MCPServer(
         "x-search",
         lifespan=server_lifespan,
         auth=build_auth_settings(config),
-        auth_server_provider=provider or XSearchOAuthProvider(config),
+        auth_server_provider=resolved,
     )
-    return TestClient(build_asgi_app(server, stateless_http=True))
+    return TestClient(build_asgi_app(server, stateless_http=True, oauth_provider=resolved))
 
 
-def _authorize(client: TestClient, challenge: str, state: str = "st-1") -> str:
-    """Run the authorization request and return the issued code."""
-    response = client.get(
+def _consent_redirect(
+    client: TestClient,
+    challenge: str,
+    *,
+    client_id: str = CLIENT_ID,
+    redirect_uri: str = REDIRECT_URI,
+    state: str = "st-1",
+    consent_secret: str = CONSENT_SECRET,
+) -> tuple[int, str]:
+    """Walk /authorize -> approval page -> POST /consent.
+
+    Returns:
+        (consent response status, redirect URL or error page body).
+    """
+    authorize = client.get(
         "/authorize",
         params={
             "response_type": "code",
-            "client_id": CLIENT_ID,
-            "redirect_uri": REDIRECT_URI,
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
             "state": state,
         },
         follow_redirects=False,
     )
-    assert response.status_code == 302, response.text
-    location = response.headers["location"]
-    assert location.startswith(REDIRECT_URI)
+    assert authorize.status_code == 302, authorize.text
+    consent_url = authorize.headers["location"]
+    assert "/consent?req=" in consent_url, consent_url
+    request_id = consent_url.split("req=", 1)[1]
+
+    approve = client.post(
+        "/consent",
+        data={"req": request_id, "consent_secret": consent_secret},
+        follow_redirects=False,
+    )
+    return approve.status_code, approve.headers.get("location", approve.text)
+
+
+def _authorize(
+    client: TestClient,
+    challenge: str,
+    state: str = "st-1",
+    *,
+    client_id: str = CLIENT_ID,
+    redirect_uri: str = REDIRECT_URI,
+) -> str:
+    """Run the full authorize + consent flow and return the issued code."""
+    status, location = _consent_redirect(
+        client, challenge, client_id=client_id, redirect_uri=redirect_uri, state=state
+    )
+    assert status == 302, location
+    assert location.startswith(redirect_uri)
     assert f"state={state}" in location
     assert f"iss={ISSUER}" in location or "iss=https%3A%2F%2Fxsearch.example.test" in location
     return location.split("code=", 1)[1].split("&", 1)[0]
@@ -346,8 +388,12 @@ def test_wrong_pkce_verifier_is_rejected(client: TestClient) -> None:
     assert response.status_code == 400
 
 
-def test_refresh_token_rotates(client: TestClient) -> None:
-    """A refresh grant returns a new access token and invalidates the old one."""
+def test_refresh_token_rotates_and_grants_a_grace_window(client: TestClient) -> None:
+    """A refresh returns new tokens, and the old one survives briefly.
+
+    The grace window exists for clients holding two connections: an instant revoke
+    makes the second concurrent refresh fail even though it is legitimate.
+    """
     verifier, challenge = _pkce_pair()
     tokens = _exchange(client, _authorize(client, challenge), verifier)
 
@@ -365,7 +411,8 @@ def test_refresh_token_rotates(client: TestClient) -> None:
     refreshed = response.json()
     assert refreshed["access_token"] != tokens["access_token"]
 
-    replayed = client.post(
+    # The just-rotated token still works inside the grace window.
+    within_grace = client.post(
         "/token",
         data={
             "grant_type": "refresh_token",
@@ -374,7 +421,29 @@ def test_refresh_token_rotates(client: TestClient) -> None:
             "client_secret": CLIENT_SECRET,
         },
     )
-    assert replayed.status_code == 400
+    assert within_grace.status_code == 200
+
+
+def test_rotated_refresh_token_is_dropped_after_the_grace_window(
+    provider: XSearchOAuthProvider,
+) -> None:
+    """The grace window must actually close, or rotation means nothing."""
+    client = provider.pre_registered_client()
+    tokens = provider._issue_tokens(client, ["x-search"])
+    assert tokens.refresh_token
+
+    loaded = asyncio.run(provider.load_refresh_token(client, tokens.refresh_token))
+    assert loaded is not None
+    asyncio.run(provider.exchange_refresh_token(client, loaded, []))
+
+    # Inside the window the rotated token is still honoured.
+    assert asyncio.run(provider.load_refresh_token(client, tokens.refresh_token)) is not None
+
+    # Age it past the window.
+    old, _ = provider._rotated_refresh[tokens.refresh_token]
+    provider._rotated_refresh[tokens.refresh_token] = (old, time.time() - 10_000)
+
+    assert asyncio.run(provider.load_refresh_token(client, tokens.refresh_token)) is None
 
 
 def test_bogus_access_token_is_rejected(client: TestClient) -> None:
@@ -414,22 +483,42 @@ def test_allowed_origin_redirect_uri_is_accepted(client: TestClient) -> None:
     """Any path on a trusted client origin is fine — Spark's callback varies."""
     _, challenge = _pkce_pair()
 
-    response = client.get(
+    status, location = _consent_redirect(
+        client,
+        challenge,
+        redirect_uri="https://oauth-redirect.googleusercontent.com/r/other",
+    )
+
+    assert status == 302
+    assert location.startswith("https://oauth-redirect.googleusercontent.com/r/other")
+
+
+def test_loopback_redirect_uri_is_rejected_by_default(client: TestClient) -> None:
+    """A public deployment must never accept a localhost callback.
+
+    Loopback URIs were previously exempt from both the HTTPS rule and the origin
+    allow-list, which is what made the unauthenticated takeover reachable.
+    """
+    response = client.post(
+        "/register",
+        json={"client_name": "attacker", "redirect_uris": [LOOPBACK_REDIRECT_URI]},
+    )
+
+    assert response.status_code == 400
+
+    _, challenge = _pkce_pair()
+    authorize = client.get(
         "/authorize",
         params={
             "response_type": "code",
             "client_id": CLIENT_ID,
-            "redirect_uri": "https://oauth-redirect.googleusercontent.com/r/other",
+            "redirect_uri": LOOPBACK_REDIRECT_URI,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
         },
         follow_redirects=False,
     )
-
-    assert response.status_code == 302
-    assert response.headers["location"].startswith(
-        "https://oauth-redirect.googleusercontent.com/r/other"
-    )
+    assert authorize.status_code == 400
 
 
 def test_off_origin_redirect_uri_is_rejected(client: TestClient) -> None:
@@ -518,21 +607,7 @@ def test_registered_public_client_completes_the_whole_flow(client: TestClient) -
     client_id = registration.json()["client_id"]
 
     verifier, challenge = _pkce_pair()
-    authorize = client.get(
-        "/authorize",
-        params={
-            "response_type": "code",
-            "client_id": client_id,
-            "redirect_uri": REDIRECT_URI,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "state": "spark-1",
-            "resource": ISSUER,
-        },
-        follow_redirects=False,
-    )
-    assert authorize.status_code == 302, authorize.text
-    code = authorize.headers["location"].split("code=", 1)[1].split("&", 1)[0]
+    code = _authorize(client, challenge, client_id=client_id, redirect_uri=REDIRECT_URI)
 
     # A public client sends no client_secret — PKCE is the only proof.
     token_response = client.post(
@@ -556,6 +631,169 @@ def test_registered_public_client_completes_the_whole_flow(client: TestClient) -
 
     assert call.status_code == 200
     assert '"name":"x-search"' in call.text
+
+
+# ------------------------------------------------- regression: the takeover path
+
+
+def test_authorize_does_not_hand_a_code_to_the_caller(client: TestClient) -> None:
+    """REGRESSION: the authorization response must not carry a code by itself.
+
+    The previous build auto-approved and returned the code in the ``Location``
+    header, so a caller that never followed the redirect could read the code out of
+    its own HTTP response. With open registration that was an unauthenticated path
+    to a working token, and the redirect-URI allow-list protected nothing.
+    """
+    _, challenge = _pkce_pair()
+
+    response = client.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": "s",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    location = response.headers["location"]
+    assert "/consent?req=" in location, "must send the browser to approval"
+    assert "code=" not in location, "no code may be issued before approval"
+
+
+def test_full_unauthenticated_takeover_is_blocked(client: TestClient) -> None:
+    """The end-to-end exploit, replayed, must fail at the approval step.
+
+    Previously: register with a loopback callback (201), authorize (code handed
+    over), exchange (200), call /mcp (200). Every one of those steps is asserted
+    closed here.
+    """
+    # 1. Loopback registration is refused outright.
+    registration = client.post(
+        "/register",
+        json={"client_name": "attacker", "redirect_uris": [LOOPBACK_REDIRECT_URI]},
+    )
+    assert registration.status_code == 400
+
+    # 2. Even with a *plausible* registration, no code is issued without consent.
+    plausible = client.post(
+        "/register",
+        json={"client_name": "attacker", "redirect_uris": [REDIRECT_URI]},
+    )
+    assert plausible.status_code == 201
+    attacker_client_id = plausible.json()["client_id"]
+
+    verifier, challenge = _pkce_pair()
+    authorize = client.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": attacker_client_id,
+            "redirect_uri": REDIRECT_URI,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    assert "code=" not in authorize.headers.get("location", "")
+
+    # 3. A wrong approval secret is refused.
+    request_id = authorize.headers["location"].split("req=", 1)[1]
+    denied = client.post(
+        "/consent",
+        data={"req": request_id, "consent_secret": "guessing"},
+        follow_redirects=False,
+    )
+    assert denied.status_code == 403
+    assert "code=" not in denied.headers.get("location", "")
+
+    # 4. The attacker has no token, so the MCP endpoint stays shut.
+    call = client.post(
+        "/mcp", json=INITIALIZE, headers={**JSON_HEADERS, "Authorization": "Bearer nope"}
+    )
+    assert call.status_code == 401
+
+
+def test_consent_requires_the_configured_secret(client: TestClient) -> None:
+    """Only the deployment's own secret approves a connection."""
+    _, challenge = _pkce_pair()
+
+    status, body = _consent_redirect(client, challenge, consent_secret="not-the-secret")
+
+    assert status == 403
+    assert "Approval failed" in body
+
+
+def test_consent_link_is_single_use(client: TestClient) -> None:
+    """An approval link cannot be replayed to mint a second code."""
+    _, challenge = _pkce_pair()
+
+    authorize = client.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    request_id = authorize.headers["location"].split("req=", 1)[1]
+
+    first = client.post(
+        "/consent",
+        data={"req": request_id, "consent_secret": CONSENT_SECRET},
+        follow_redirects=False,
+    )
+    assert first.status_code == 302
+
+    second = client.post(
+        "/consent",
+        data={"req": request_id, "consent_secret": CONSENT_SECRET},
+        follow_redirects=False,
+    )
+    assert second.status_code == 400
+    assert "code=" not in second.headers.get("location", "")
+
+
+def test_consent_page_is_served_and_does_not_leak_the_secret(client: TestClient) -> None:
+    """The approval page renders, and never echoes the secret back."""
+    _, challenge = _pkce_pair()
+
+    authorize = client.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    request_id = authorize.headers["location"].split("req=", 1)[1]
+
+    page = client.get("/consent", params={"req": request_id})
+
+    assert page.status_code == 200
+    assert "Approve connection" in page.text
+    assert CONSENT_SECRET not in page.text
+
+
+def test_expired_consent_link_is_rejected(client: TestClient) -> None:
+    """An unknown or stale request id must not be approvable."""
+    response = client.post(
+        "/consent",
+        data={"req": "never-issued", "consent_secret": CONSENT_SECRET},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 400
 
 
 def test_root_head_probe_returns_the_auth_challenge(client: TestClient) -> None:

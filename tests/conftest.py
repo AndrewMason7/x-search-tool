@@ -1,5 +1,6 @@
 """Shared test fixtures, isolation hooks, and sample API v2 responses."""
 
+import os
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -8,6 +9,21 @@ import httpx
 import pytest
 
 from x_search.client import XClient
+
+
+@pytest.fixture(autouse=True)
+def isolate_from_ambient_search_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stop the ambient shell from changing what these tests exercise.
+
+    ``x_search.server`` builds its module-level server at import time from
+    ``X_SEARCH_*`` environment variables. A stray ``X_SEARCH_PUBLIC_URL`` in the
+    developer's shell would silently turn every non-OAuth test into an
+    OAuth-enabled one, and tests that construct their own config would inherit an
+    unexpected store path. Clear the whole namespace so each test states its own.
+    """
+    for name in list(os.environ):
+        if name.startswith("X_SEARCH_"):
+            monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(autouse=True)

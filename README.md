@@ -188,21 +188,44 @@ The MCP SDK hardcodes the first field to the two secret-based methods, so
 
 #### What keeps open registration safe
 
-Registration is open to anyone, so the gate is the redirect URI. Registrations are
-only accepted from Google-owned origins — the suffix match covers
-`oauth-redirect.googleusercontent.com`, `oauth-redirect-sandbox.googleusercontent.com`
-and `oauth-redirect-test.googleusercontent.com`, which is where all six of Spark's
+Registration is open to anyone, so the redirect URI is the first gate.
+Registrations are only accepted from Google-owned origins — the suffix match
+covers `oauth-redirect.googleusercontent.com`,
+`oauth-redirect-sandbox.googleusercontent.com` and
+`oauth-redirect-test.googleusercontent.com`, which is where all six of Spark's
 real redirect URIs live (override with
-`X_SEARCH_OAUTH_ALLOWED_REDIRECT_ORIGINS`). A hostile registrant cannot receive
-the authorization code because it does not control that origin, and PKCE — which
-Spark always sends — protects the code even if it leaked. Registered clients are
-stored with **no** client secret and `token_endpoint_auth_method: "none"`.
+`X_SEARCH_OAUTH_ALLOWED_REDIRECT_ORIGINS`). Loopback callbacks are refused unless
+`X_SEARCH_OAUTH_ALLOW_LOOPBACK=1`, and an empty allow-list refuses to start rather
+than accepting everything.
+
+**The redirect allow-list is necessary but not sufficient**, and it is a mistake to
+treat it as the security boundary. An authorization code is returned in the
+`Location` header of the authorization response, so a caller that never follows
+the redirect can read the code out of its own HTTP response. Origin gating cannot
+stop that.
+
+The real gate is the **approval step**. `GET /authorize` no longer issues anything:
+it redirects the browser to `/consent`, and a code is only minted when a human
+submits the deployment's approval secret. An anonymous caller can register a
+client and start a flow, but it cannot approve one.
+
+```bash
+# read the generated approval secret
+python -c "import json,pathlib; print(json.loads(pathlib.Path('$HOME/.config/xsearch-oauth.json').read_text())['pre_registered_client']['consent_secret'])"
+```
+
+Override with `X_SEARCH_CONSENT_SECRET`. When Spark connects it opens the approval
+page in a browser; enter the secret there once.
 
 Spark is a public client: real traces show it sending `client_id`, `code`,
 `code_verifier` and `redirect_uri` to `/token` and **no client secret**, even when
 it was given one to paste in. The pre-registered client is therefore public by
 default. Set `X_SEARCH_OAUTH_TOKEN_AUTH_METHOD=client_secret_post` (or
 `client_secret_basic`) only if you need a genuinely confidential client.
+
+Refresh tokens rotate, but a rotated-out token stays valid for
+`REFRESH_REUSE_GRACE_SECONDS` (120s) so a client holding two connections does not
+have its second concurrent refresh rejected.
 
 #### Reverse proxy
 

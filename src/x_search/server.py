@@ -72,10 +72,16 @@ def _build_server() -> MCPServer[Any]:
     ``X_SEARCH_PUBLIC_URL`` is set — without it this returns exactly the same
     unauthenticated server as before, so the stdio transport used by local hosts
     (Hermes, Claude Desktop, Cursor) is untouched.
+
+    Also sets the module-level :data:`oauth_provider` so the HTTP layer can mount
+    the consent page without reaching into private SDK attributes.
     """
+    global oauth_provider
+
     oauth_config = OAuthConfig.from_env()
 
     if oauth_config is None:
+        oauth_provider = None
         return MCPServer(
             "x-search",
             description="X (Twitter) recent search, full-archive search, post lookup, and rate limit suite",
@@ -84,11 +90,13 @@ def _build_server() -> MCPServer[Any]:
 
     provider = XSearchOAuthProvider(oauth_config)
     provider.pre_registered_client()
+    oauth_provider = provider
     logger.info(
-        "OAuth enabled: issuer=%s client_id=%s state=%s",
+        "OAuth enabled: issuer=%s client_id=%s state=%s registration=%s",
         oauth_config.issuer_url,
         oauth_config.client_id,
         oauth_config.store_path,
+        "on" if oauth_config.registration_enabled else "off",
     )
     return MCPServer(
         "x-search",
@@ -98,6 +106,12 @@ def _build_server() -> MCPServer[Any]:
         auth_server_provider=provider,
     )
 
+
+#: The OAuth provider backing this process, or None when OAuth is disabled. Declared
+#: before the server is built so ``_build_server`` can populate it, and exposed so
+#: the HTTP layer can mount the consent page with an explicit reference instead of
+#: reaching into ``MCPServer``'s private attributes.
+oauth_provider: XSearchOAuthProvider | None = None
 
 mcp = _build_server()
 

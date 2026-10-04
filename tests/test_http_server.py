@@ -12,10 +12,24 @@ import logging
 from collections.abc import Iterator
 
 import pytest
+from mcp.server.mcpserver import MCPServer
 from starlette.testclient import TestClient
 
 from x_search.http_server import HEALTH_PATH, AuthDebugMiddleware, build_asgi_app
-from x_search.server import mcp
+from x_search.server import server_lifespan
+
+
+@pytest.fixture
+def mcp() -> MCPServer:
+    """A plain server with no OAuth configured.
+
+    Built fresh rather than reusing the module singleton: the singleton is
+    constructed at import time from the ambient environment, so a stray
+    ``X_SEARCH_PUBLIC_URL`` in the shell would silently turn these tests into
+    OAuth-enabled ones.
+    """
+    return MCPServer("x-search", lifespan=server_lifespan)
+
 
 TOKEN = "test-bearer-token"
 INITIALIZE = {
@@ -32,7 +46,7 @@ JSON_HEADERS = {"Accept": "application/json, text/event-stream"}
 
 
 @pytest.fixture
-def authed_client() -> Iterator[TestClient]:
+def authed_client(mcp: MCPServer) -> Iterator[TestClient]:
     """A client for the dual-transport app with bearer auth enabled."""
     app = build_asgi_app(mcp, stateless_http=True, bearer_token=TOKEN)
     with TestClient(app) as client:
@@ -40,7 +54,7 @@ def authed_client() -> Iterator[TestClient]:
 
 
 @pytest.fixture
-def open_client() -> Iterator[TestClient]:
+def open_client(mcp: MCPServer) -> Iterator[TestClient]:
     """A client for the dual-transport app with no bearer auth."""
     app = build_asgi_app(mcp, stateless_http=True, bearer_token=None)
     with TestClient(app) as client:
@@ -96,7 +110,7 @@ def test_streamable_http_handshake_with_token(authed_client: TestClient) -> None
     assert '"protocolVersion":"2025-06-18"' in response.text
 
 
-def test_sse_transport_is_mounted() -> None:
+def test_sse_transport_is_mounted(mcp: MCPServer) -> None:
     """The legacy HTTP+SSE stream must be mounted alongside streamable HTTP.
 
     Asserted structurally: an open SSE stream never completes, so reading one
@@ -110,7 +124,7 @@ def test_sse_transport_is_mounted() -> None:
     assert "/mcp" in paths
 
 
-def test_streamable_only_mounts_no_sse() -> None:
+def test_streamable_only_mounts_no_sse(mcp: MCPServer) -> None:
     """A streamable-only deployment must not expose the SSE routes."""
     app = build_asgi_app(mcp, enable_streamable_http=True, enable_sse=False, bearer_token=None)
     paths = {getattr(route, "path", None) for route in app.routes}  # type: ignore[attr-defined]
@@ -127,29 +141,34 @@ def test_no_auth_configured_serves_requests(open_client: TestClient) -> None:
     assert '"name":"x-search"' in response.text
 
 
-def test_requires_at_least_one_transport() -> None:
+def test_requires_at_least_one_transport(mcp: MCPServer) -> None:
     """Disabling every transport is a configuration error, not a silent no-op."""
     with pytest.raises(ValueError, match="At least one"):
         build_asgi_app(mcp, enable_streamable_http=False, enable_sse=False)
 
 
-def test_rejects_colliding_paths() -> None:
+def test_rejects_colliding_paths(mcp: MCPServer) -> None:
     """A streamable path that shadows the SSE path must fail loudly at startup."""
     with pytest.raises(ValueError, match="collide"):
         build_asgi_app(mcp, streamable_http_path="/sse", sse_path="/sse")
 
 
-def test_empty_bearer_token_is_rejected() -> None:
+def test_empty_bearer_token_is_rejected(mcp: MCPServer) -> None:
     """An empty token must fail loudly instead of silently disabling auth."""
     with pytest.raises(ValueError, match="empty"):
         build_asgi_app(mcp, bearer_token="")
 
 
-def test_none_bearer_token_disables_auth() -> None:
-    """Passing None is the documented way to run without bearer auth."""
-    app = build_asgi_app(mcp, bearer_token=None)
+def test_none_bearer_token_actually_disables_auth(mcp: MCPServer) -> None:
+    """Passing None must let an unauthenticated request through.
 
-    assert app is not None
+    Asserting the behaviour rather than ``app is not None``: the old assertion
+    could not fail for the reason it named.
+    """
+    with TestClient(build_asgi_app(mcp, stateless_http=True, bearer_token=None)) as client:
+        response = client.post("/mcp", json=INITIALIZE, headers=JSON_HEADERS)
+
+    assert response.status_code == 200
 
 
 async def test_auth_debug_middleware_redacts_secrets() -> None:

@@ -26,7 +26,7 @@ from x_search.http_server import (
     DEFAULT_STREAMABLE_HTTP_PATH,
     run_http_server,
 )
-from x_search.server import configure_logging, mcp
+from x_search.server import configure_logging, mcp, oauth_provider
 
 TRANSPORT_CHOICES = ("stdio", "sse", "streamable-http", "both")
 HTTP_TRANSPORTS = ("sse", "streamable-http", "both")
@@ -141,6 +141,7 @@ def main() -> None:
         stateless_http=args.stateless,
         bearer_token=args.bearer_token,
         access_log=args.access_log,
+        oauth_provider=oauth_provider,
     )
 
 

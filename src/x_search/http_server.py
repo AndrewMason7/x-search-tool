@@ -27,6 +27,7 @@ static check runs first and would reject OAuth-issued tokens).
 
 from __future__ import annotations
 
+import html
 import logging
 import os
 import secrets
@@ -36,10 +37,17 @@ from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import parse_qs
 
+from mcp.server.auth.provider import AuthorizeError
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse, PlainTextResponse, Response
+from starlette.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
 from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -220,6 +228,91 @@ def _json_endpoint(document: dict[str, Any]) -> Any:
     return endpoint
 
 
+def _consent_html(client_name: str, request_id: str, error: str | None) -> str:
+    """Render the approval page.
+
+    Deliberately dependency-free: it is a handful of lines of HTML and a form, so
+    there is no template engine to keep in sync and nothing to escape beyond the
+    two interpolated values.
+    """
+    error_block = f'<p class="err">{html.escape(error)}</p>' if error else ""
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Approve connection</title>
+<style>
+ body {{ font: 16px/1.5 system-ui, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; }}
+ .card {{ border: 1px solid #d0d0d0; border-radius: 10px; padding: 1.5rem; }}
+ .err {{ color: #b00020; }}
+ code {{ background: #f2f2f2; padding: .1rem .3rem; border-radius: 4px; }}
+ input[type=password] {{ width: 100%; padding: .6rem; font-size: 1rem; box-sizing: border-box; }}
+ button {{ margin-top: 1rem; padding: .6rem 1.2rem; font-size: 1rem; cursor: pointer; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Approve connection</h1>
+  <p><strong>{html.escape(client_name)}</strong> is asking to use the X search tools
+     on this server.</p>
+  {error_block}
+  <p>Enter the approval secret for this deployment to allow it.</p>
+  <form method="post" action="/consent">
+    <input type="hidden" name="req" value="{html.escape(request_id)}">
+    <label for="consent_secret">Approval secret</label>
+    <input id="consent_secret" name="consent_secret" type="password"
+           autocomplete="off" autofocus required>
+    <button type="submit">Approve</button>
+  </form>
+</div>
+</body>
+</html>"""
+
+
+def _consent_endpoints(provider: Any) -> tuple[Any, Any]:
+    """Build the GET/POST handlers for the approval page."""
+
+    async def page(request: Any) -> HTMLResponse:
+        request_id = request.query_params.get("req", "")
+        params = await provider.pending_authorization(request_id)
+        if params is None:
+            return HTMLResponse(
+                _consent_html(
+                    "This request",
+                    request_id,
+                    "This approval link has expired or was already used. Start the "
+                    "connection again from your client.",
+                ),
+                status_code=400,
+            )
+        return HTMLResponse(_consent_html(provider.client_name, request_id, None))
+
+    async def submit(request: Any) -> Response:
+        form = await request.form()
+        request_id = str(form.get("req", ""))
+        consent_secret = str(form.get("consent_secret", ""))
+
+        try:
+            redirect_url = await provider.approve_authorization(request_id, consent_secret)
+        except AuthorizeError as exc:
+            params = await provider.pending_authorization(request_id)
+            status = 403 if params is not None else 400
+            return HTMLResponse(
+                _consent_html(
+                    provider.client_name,
+                    request_id,
+                    f"Approval failed: {exc.error_description or exc.error}",
+                ),
+                status_code=status,
+            )
+
+        logger.info("Consent granted; redirecting to the client")
+        return RedirectResponse(redirect_url, status_code=302)
+
+    return page, submit
+
+
 def _root_probe_endpoint(mcp: MCPServer[Any]) -> Any:
     """Answer Spark's probes of the origin root.
 
@@ -300,6 +393,7 @@ def build_asgi_app(
     stateless_http: bool = False,
     bearer_token: str | None = None,
     host: str = DEFAULT_HOST,
+    oauth_provider: Any | None = None,
 ) -> ASGIApp:
     """Compose the streamable-HTTP and SSE transports into one ASGI application.
 
@@ -312,11 +406,14 @@ def build_asgi_app(
         stateless_http: When True the streamable transport issues no session ID,
             which is more forgiving with clients that do not replay
             ``Mcp-Session-Id``. Recommended behind a reverse proxy.
-        bearer_token: When set, require this bearer token on all requests except
-            ``/health`` and the OAuth resource-metadata probe.
+        bearer_token: When set, require this static bearer token on all requests
+            except ``/health`` and the OAuth resource-metadata probe.
         host: Origin host used for the transport-security policy. The public
             hostname differs (it is the tunnel's), so DNS-rebinding protection is
             disabled and left to the proxy layer.
+        oauth_provider: The OAuth provider, when OAuth is configured. Required for
+            the approval page: without it ``/authorize`` parks a request that
+            nothing can approve, so no token can ever be issued.
 
     Raises:
         ValueError: If neither transport is enabled, or the paths collide.
@@ -392,7 +489,20 @@ def build_asgi_app(
         # Spark probes the origin root with HEAD before it will talk to the MCP
         # endpoint. Answer with the same 401 challenge the MCP endpoint gives, so
         # the probe carries the resource_metadata pointer instead of a bare 404.
-        routes.insert(0, Route("/", _root_probe_endpoint(mcp), methods=["HEAD"]))
+        routes.insert(0, Route("/", _root_probe_endpoint(mcp), methods=["HEAD", "GET"]))
+
+        # The approval page. Without it the authorization endpoint parks a request
+        # that nothing can approve, so refuse to start rather than serve a server
+        # that silently cannot issue a token.
+        if oauth_provider is None:
+            raise ValueError(
+                "OAuth is configured on the MCP server but no oauth_provider was passed "
+                "to build_asgi_app: the approval page would be missing and no client "
+                "could ever complete the flow."
+            )
+        consent_page, consent_submit = _consent_endpoints(oauth_provider)
+        routes.insert(0, Route("/consent", consent_page, methods=["GET"]))
+        routes.insert(0, Route("/consent", consent_submit, methods=["POST"]))
     routes.insert(
         0, Route(HEALTH_PATH, _health_endpoint(mcp.name or "x-search", transports), methods=["GET"])
     )
@@ -463,6 +573,7 @@ def run_http_server(
     stateless_http: bool = False,
     bearer_token: str | None = None,
     access_log: bool = False,
+    oauth_provider: Any | None = None,
 ) -> None:
     """Serve the MCP server over HTTP until interrupted."""
     try:
@@ -483,6 +594,7 @@ def run_http_server(
         stateless_http=stateless_http,
         bearer_token=bearer_token,
         host=host,
+        oauth_provider=oauth_provider,
     )
 
     logger.info(
