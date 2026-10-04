@@ -158,32 +158,48 @@ X_SEARCH_OAUTH_STORE="$HOME/.config/xsearch-oauth.json" \
   x-search --transport both --host 127.0.0.1 --port 8091
 ```
 
-On first start it generates a client ID and secret and persists them. Read them
-back with:
-
-```bash
-python -c "import json,pathlib; print(json.loads(pathlib.Path('$HOME/.config/xsearch-oauth.json').read_text())['pre_registered_client'])"
-```
+On first start it generates a client ID and secret and persists them. Spark does
+**not** need them: it registers itself.
 
 Then, in **Settings & help → Connected Apps → Custom apps for Spark → Add a
-custom app**:
+custom app**, enter the MCP server URL and click **Next**:
 
-| Field | Value |
-|---|---|
-| MCP server URL | `https://mcp.example.com/mcp` |
-| Advanced features → Client ID | the generated `client_id` |
-| Advanced features → Client secret | the generated `client_secret` |
+```
+https://mcp.example.com/mcp
+```
 
-Dynamic Client Registration is deliberately **not** advertised, so Spark falls
-back to those two fields — the path that is verified to work end to end.
-Authorization auto-approves and redirects straight back: the deployment is
-single-tenant and the client is confidential, so possession of the client secret
-*is* the authorization decision, and an authorization code is only redeemable by
-whoever also holds that secret.
+**Leave "Advanced features" collapsed.** That manual-credentials path is only for
+servers without Dynamic Client Registration; this server advertises
+`registration_endpoint`, so Spark registers itself.
 
-If the token exchange fails, client and server disagree about how the secret is
+#### Why the two metadata fields matter
+
+Two fields in `/.well-known/oauth-authorization-server` decide whether Spark
+accepts the server at all:
+
+| Field | Required value | What happens otherwise |
+|---|---|---|
+| `token_endpoint_auth_methods_supported` | must include `"none"` | Spark is a **public** client. Advertise only `client_secret_post` / `client_secret_basic` and it refuses with *"This MCP server uses an authentication method that Gemini doesn't support."* |
+| `registration_endpoint` | present | Without it Spark cannot self-register and falls back to asking for a client ID and secret |
+
+The MCP SDK hardcodes the first field to the two secret-based methods, so
+`x_search.http_server` **shadows** the SDK's metadata route with its own document
+(`x_search.oauth.authorization_server_metadata`).
+
+#### What keeps open registration safe
+
+Registration is open to anyone, so the gate is the redirect URI. Registrations are
+only accepted from Google-owned origins (`oauth-redirect.googleusercontent.com`
+and `google.com` by default; override with
+`X_SEARCH_OAUTH_ALLOWED_REDIRECT_ORIGINS`). A hostile registrant cannot receive
+the authorization code because it does not control that origin, and PKCE — which
+Spark always sends — protects the code even if it leaked. Registered clients are
+stored with **no** client secret and `token_endpoint_auth_method: "none"`.
+
+If the token exchange fails, client and server disagree about how a secret is
 presented. Switch with `X_SEARCH_OAUTH_TOKEN_AUTH_METHOD=client_secret_basic`
-(default `client_secret_post`).
+(default `client_secret_post`); this only affects the pre-registered fallback
+client, not dynamically registered public ones.
 
 #### Reverse proxy
 

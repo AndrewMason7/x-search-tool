@@ -44,6 +44,7 @@ from mcp.server.auth.provider import (
     AuthorizationParams,
     OAuthAuthorizationServerProvider,
     RefreshToken,
+    RegistrationError,
     construct_redirect_uri,
 )
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
@@ -59,6 +60,19 @@ ACCESS_TOKEN_TTL_SECONDS = 3600
 REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30
 AUTHORIZATION_CODE_TTL_SECONDS = 300
 
+#: Gemini Spark registers dynamically and completes the flow at Google's own
+#: callback origin. Restricting registrations to Google-owned origins is what
+#: keeps open Dynamic Client Registration from being an open door: a hostile
+#: registrant cannot receive the authorization code, so its client is inert.
+#: ``oauth-redirect.googleusercontent.com`` is the origin observed in real Spark
+#: traffic; ``google.com`` is included so a change of callback host does not
+#: silently break registration. Override with
+#: ``X_SEARCH_OAUTH_ALLOWED_REDIRECT_ORIGINS`` (comma-separated).
+DEFAULT_ALLOWED_REDIRECT_ORIGINS = (
+    "oauth-redirect.googleusercontent.com",
+    "google.com",
+)
+
 #: OAuth 2.1 lets a confidential client present its secret either in the request
 #: body (``client_secret_post``) or via HTTP Basic (``client_secret_basic``). The
 #: SDK authenticator picks exactly one based on the registered client, and clients
@@ -69,31 +83,75 @@ DEFAULT_TOKEN_AUTH_METHOD = "client_secret_post"
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]"})
 
 
-class OpenRedirectClient(OAuthClientInformationFull):
-    """Confidential client that accepts any HTTPS redirect URI.
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    """Read a boolean-ish environment variable."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
-    A client's redirect URI is normally validated by exact match against the ones
-    registered with it. That does not work here: Gemini Spark redirects back to a
-    Google-hosted origin that is neither documented nor stable enough to pin, and
-    exact-match validation rejects the flow with *"Invalid redirect URI"* — the
-    same failure Home Assistant hit.
 
-    Relaxing this does not open a redirect hole worth worrying about. An
-    authorization code is only ever redeemable by a caller that also holds the
-    client secret, so a code delivered to an unregistered URI is inert. Requiring
-    HTTPS (or loopback, for local testing) keeps the code off plaintext links.
+class SparkClient(OAuthClientInformationFull):
+    """A client whose redirect URIs must land on a trusted origin.
+
+    This is what makes open Dynamic Client Registration safe. Anyone can POST to
+    the registration endpoint, but a client is only usable if it can receive the
+    authorization code — and codes are only ever delivered to an allowed origin.
+    In practice that means Google's own Spark callback, a domain the registrant
+    does not control, so a hostile registration yields a client that can never
+    obtain a token. Combined with PKCE (which Spark always sends) this gives the
+    public-client model real protection without a shared secret.
     """
+
+    allowed_redirect_origins: tuple[str, ...] = ()
 
     def validate_redirect_uri(self, redirect_uri: AnyUrl | None) -> AnyUrl:
         if redirect_uri is None:
             return super().validate_redirect_uri(redirect_uri)
 
         parsed = urlparse(str(redirect_uri))
-        if parsed.scheme != "https" and (parsed.hostname or "") not in LOOPBACK_HOSTS:
+        host = (parsed.hostname or "").lower()
+
+        if parsed.scheme != "https" and host not in LOOPBACK_HOSTS:
+            raise InvalidRedirectUriError(f"Redirect URI must use https; got {redirect_uri}")
+
+        if host in LOOPBACK_HOSTS:
+            return redirect_uri
+
+        allowed = self.allowed_redirect_origins
+        if allowed and not any(host == origin or host.endswith(f".{origin}") for origin in allowed):
             raise InvalidRedirectUriError(
-                f"Redirect URI must use https (or loopback for testing); got {redirect_uri}"
+                f"Redirect URI host {host!r} is not an allowed client origin "
+                f"(allowed: {', '.join(allowed)})"
             )
         return redirect_uri
+
+
+def _validate_registration_redirect_uris(
+    redirect_uris: list[AnyUrl] | None, allowed_origins: tuple[str, ...]
+) -> None:
+    """Reject a registration whose redirect URIs could never receive a code.
+
+    Raises:
+        RegistrationError: If any redirect URI is non-HTTPS or off-origin.
+    """
+    if not redirect_uris:
+        raise RegistrationError("invalid_redirect_uri", "At least one redirect_uri is required")
+
+    for uri in redirect_uris:
+        parsed = urlparse(str(uri))
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" and host not in LOOPBACK_HOSTS:
+            raise RegistrationError("invalid_redirect_uri", f"Redirect URI must use https: {uri}")
+        if host in LOOPBACK_HOSTS:
+            continue
+        if allowed_origins and not any(
+            host == origin or host.endswith(f".{origin}") for origin in allowed_origins
+        ):
+            raise RegistrationError(
+                "invalid_redirect_uri",
+                f"Redirect URI host {host!r} is not permitted on this server",
+            )
 
 
 @dataclass(frozen=True)
@@ -106,6 +164,8 @@ class OAuthConfig:
     store_path: Path
     subject: str = DEFAULT_SUBJECT
     token_auth_method: str = DEFAULT_TOKEN_AUTH_METHOD
+    allowed_redirect_origins: tuple[str, ...] = DEFAULT_ALLOWED_REDIRECT_ORIGINS
+    registration_enabled: bool = True
 
     @property
     def client_name(self) -> str:
@@ -131,6 +191,16 @@ class OAuthConfig:
 
         store_path = Path(os.getenv("X_SEARCH_OAUTH_STORE") or DEFAULT_STORE_PATH).expanduser()
         subject = os.getenv("X_SEARCH_OAUTH_SUBJECT") or DEFAULT_SUBJECT
+
+        raw_origins = os.getenv("X_SEARCH_OAUTH_ALLOWED_REDIRECT_ORIGINS")
+        if raw_origins is None:
+            allowed_origins = DEFAULT_ALLOWED_REDIRECT_ORIGINS
+        else:
+            allowed_origins = tuple(
+                part.strip().lower().lstrip(".") for part in raw_origins.split(",") if part.strip()
+            )
+
+        registration_enabled = _env_flag("X_SEARCH_OAUTH_DYNAMIC_REGISTRATION", default=True)
 
         token_auth_method = (
             os.getenv("X_SEARCH_OAUTH_TOKEN_AUTH_METHOD") or DEFAULT_TOKEN_AUTH_METHOD
@@ -158,6 +228,8 @@ class OAuthConfig:
             store_path=store_path,
             subject=subject,
             token_auth_method=token_auth_method,
+            allowed_redirect_origins=allowed_origins,
+            registration_enabled=registration_enabled,
         )
 
 
@@ -200,7 +272,7 @@ class XSearchOAuthProvider(
         self._codes: dict[str, AuthorizationCode] = {}
         self._access_tokens: dict[str, AccessToken] = {}
         self._refresh_tokens: dict[str, RefreshToken] = {}
-        self._pre_registered: OpenRedirectClient | None = None
+        self._pre_registered: SparkClient | None = None
         self._load()
 
     # ------------------------------------------------------------------ state
@@ -257,7 +329,7 @@ class XSearchOAuthProvider(
         restart (a round-trip through JSON would reload it as the base model).
         """
         if self._pre_registered is None:
-            self._pre_registered = OpenRedirectClient(
+            self._pre_registered = SparkClient(
                 client_id=self._config.client_id,
                 client_secret=self._config.client_secret,
                 client_name=self._config.client_name,
@@ -267,6 +339,7 @@ class XSearchOAuthProvider(
                 response_types=["code"],
                 scope="x-search",
                 client_id_issued_at=int(time.time()),
+                allowed_redirect_origins=self._config.allowed_redirect_origins,
             )
         return self._pre_registered
 
@@ -284,17 +357,45 @@ class XSearchOAuthProvider(
         return client
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        """Persist a dynamically registered client.
+        """Register a client, forcing the public-client model Spark uses.
 
-        Dynamic Client Registration is advertised as unavailable, so the SDK does
-        not route here in normal operation; keeping it working means an operator can
-        turn DCR on without rewriting the provider.
+        Gemini Spark registers dynamically (RFC 7591) with ``client_name``
+        ``"Google"`` and several ``https://oauth-redirect.googleusercontent.com``
+        callbacks, and it expects to be a **public** client: the reference
+        implementations advertise ``token_endpoint_auth_methods_supported:
+        ["none"]`` and return no ``client_secret``. PKCE is what protects the code.
+
+        Registration is open, so the redirect URIs are the gate: a client whose
+        callbacks are not on a trusted origin could never receive a code anyway,
+        and rejecting it here makes that explicit rather than silent.
+
+        Raises:
+            RegistrationError: If the requested redirect URIs are unusable.
         """
         if not client_info.client_id:
-            raise ValueError("client_id is required to register a client")
-        self._clients[client_info.client_id] = client_info
+            raise RegistrationError("invalid_client_metadata", "client_id is required")
+
+        _validate_registration_redirect_uris(
+            client_info.redirect_uris, self._config.allowed_redirect_origins
+        )
+
+        # Never hand out a secret, and never let a registrant claim one: the whole
+        # point of this flow is that the client cannot keep one.
+        public_client = client_info.model_copy(
+            update={
+                "client_secret": None,
+                "token_endpoint_auth_method": "none",
+                "client_secret_expires_at": None,
+            }
+        )
+        self._clients[public_client.client_id] = public_client
         self._persist()
-        logger.info("Registered OAuth client %s", client_info.client_id)
+        logger.info(
+            "Registered public OAuth client %s (%s) redirect_uris=%s",
+            public_client.client_id,
+            public_client.client_name,
+            [str(u) for u in public_client.redirect_uris or []],
+        )
 
     # ---------------------------------------------------------------- authorize
 
@@ -305,10 +406,11 @@ class XSearchOAuthProvider(
     ) -> str:
         """Issue an authorization code and redirect straight back to the client.
 
-        There is no consent screen: the deployment is single-tenant and the client
-        is confidential, so possession of the client secret is the authorization
-        decision. The code is only delivered to a redirect URI that was validated
-        against the client's registration by the SDK before this is called.
+        There is no consent screen. Spark is a public client, so the security
+        rests on PKCE (which the SDK verifies at the token endpoint) plus the fact
+        that a code is only ever delivered to a redirect URI on a trusted origin —
+        Google's own callback, which the registrant does not control. A code that
+        leaks anywhere else is unredeemable.
         """
         code = secrets.token_urlsafe(32)
         authorization_code = AuthorizationCode(
@@ -453,9 +555,14 @@ class XSearchOAuthProvider(
 def build_auth_settings(config: OAuthConfig) -> AuthSettings:
     """Assemble the SDK auth settings for this deployment.
 
-    Dynamic Client Registration is deliberately disabled: a client that cannot
-    self-register falls back to asking the operator for a client ID and secret,
-    which is the path that is actually verified to work end to end.
+    Dynamic Client Registration is enabled because that is Spark's default path:
+    it registers itself with ``client_name: "Google"`` and never touches the
+    Advanced credentials fields. The pre-registered client stays available as a
+    fallback for clients that cannot self-register.
+
+    Scopes are left unvalidated (``valid_scopes=None``): Spark requests a
+    Google-specific scope name, and rejecting an unknown scope would fail the
+    authorization request for no security benefit.
     """
     return AuthSettings(
         issuer_url=AnyHttpUrl(config.issuer_url),
@@ -463,9 +570,52 @@ def build_auth_settings(config: OAuthConfig) -> AuthSettings:
         # Refuse tokens minted for a different resource: without this the SDK
         # warns (and from 3.0 will default to True anyway).
         validate_token_resource=True,
-        client_registration_options=ClientRegistrationOptions(enabled=False),
+        client_registration_options=ClientRegistrationOptions(
+            enabled=config.registration_enabled,
+            valid_scopes=None,
+            default_scopes=None,
+        ),
         revocation_options=RevocationOptions(enabled=True),
     )
+
+
+def authorization_server_metadata(settings: AuthSettings) -> dict[str, Any]:
+    """Build the RFC 8414 document ourselves.
+
+    The SDK hardcodes ``token_endpoint_auth_methods_supported`` to the two
+    secret-based methods. That single field is why Spark refuses the server with
+    *"This MCP server uses an authentication method that Gemini doesn't support.
+    Gemini requires standard OAuth for server connections."* — Spark is a **public**
+    client, and it needs ``none`` advertised so it can complete a PKCE exchange
+    without a shared secret.
+
+    The shadowing route that serves this document lives in ``http_server``; it has
+    to be registered ahead of the SDK's own route to win.
+    """
+    issuer = str(settings.issuer_url)
+    base = issuer.rstrip("/")
+
+    document: dict[str, Any] = {
+        "issuer": issuer,
+        "authorization_endpoint": f"{base}/authorize",
+        "token_endpoint": f"{base}/token",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        # Public client: PKCE protects the code, no shared secret exists.
+        "token_endpoint_auth_methods_supported": ["none"],
+    }
+
+    registration = settings.client_registration_options
+    if registration is not None and registration.enabled:
+        document["registration_endpoint"] = f"{base}/register"
+
+    revocation = settings.revocation_options
+    if revocation is not None and revocation.enabled:
+        document["revocation_endpoint"] = f"{base}/revoke"
+        document["revocation_endpoint_auth_methods_supported"] = ["none"]
+
+    return document
 
 
 def describe_client(config: OAuthConfig) -> str:

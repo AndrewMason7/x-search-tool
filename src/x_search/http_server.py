@@ -38,9 +38,11 @@ from urllib.parse import parse_qs
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+from x_search.oauth import authorization_server_metadata
 
 logger = logging.getLogger("x_search.http")
 
@@ -208,6 +210,44 @@ def _oauth_metadata_endpoint(_request: Any) -> JSONResponse:
     return JSONResponse({})
 
 
+def _json_endpoint(document: dict[str, Any]) -> Any:
+    """Serve a static JSON document, built once at startup."""
+
+    async def endpoint(_request: Any) -> JSONResponse:
+        return JSONResponse(document)
+
+    return endpoint
+
+
+def _root_probe_endpoint(mcp: MCPServer[Any]) -> Any:
+    """Answer Spark's bare ``HEAD /`` probe with the MCP 401 challenge.
+
+    Spark treats the URL as a single Streamable-HTTP endpoint and probes the
+    origin root before talking to ``/mcp``. A bare 404 there gives it nothing to
+    work with; the same ``WWW-Authenticate`` the MCP endpoint returns hands it the
+    ``resource_metadata`` pointer straight away.
+    """
+
+    async def probe(_request: Any) -> Response:
+        settings = getattr(mcp, "settings", None)
+        auth_settings = getattr(settings, "auth", None)
+        if auth_settings is None:
+            return Response(status_code=200)
+
+        resource_url = str(auth_settings.resource_server_url).rstrip("/")
+        metadata_url = f"{resource_url}/.well-known/oauth-protected-resource"
+        return Response(
+            status_code=401,
+            headers={
+                "WWW-Authenticate": (
+                    f'Bearer error="unauthorized", resource_metadata="{metadata_url}"'
+                )
+            },
+        )
+
+    return probe
+
+
 def build_asgi_app(
     mcp: MCPServer[Any],
     *,
@@ -283,7 +323,8 @@ def build_asgi_app(
     # document pointing at our authorization server. That must win: inserting the
     # "no auth here" stub in front of it would send clients hunting for a
     # registration endpoint that is deliberately absent.
-    auth_configured = bool(getattr(getattr(mcp, "settings", None), "auth", None))
+    auth_settings = getattr(getattr(mcp, "settings", None), "auth", None)
+    auth_configured = auth_settings is not None
     if not auth_configured:
         routes.insert(
             0,
@@ -293,6 +334,24 @@ def build_asgi_app(
                 methods=["GET"],
             ),
         )
+    else:
+        # Shadow the SDK's authorization-server metadata document. Its version
+        # advertises only the secret-based token endpoint auth methods, and Spark
+        # is a public client — it rejects the server outright with "uses an
+        # authentication method that Gemini doesn't support". Registered first so
+        # Starlette matches this route before the SDK's.
+        routes.insert(
+            0,
+            Route(
+                "/.well-known/oauth-authorization-server",
+                _json_endpoint(authorization_server_metadata(auth_settings)),
+                methods=["GET", "OPTIONS"],
+            ),
+        )
+        # Spark probes the origin root with HEAD before it will talk to the MCP
+        # endpoint. Answer with the same 401 challenge the MCP endpoint gives, so
+        # the probe carries the resource_metadata pointer instead of a bare 404.
+        routes.insert(0, Route("/", _root_probe_endpoint(mcp), methods=["HEAD"]))
     routes.insert(
         0, Route(HEALTH_PATH, _health_endpoint(mcp.name or "x-search", transports), methods=["GET"])
     )

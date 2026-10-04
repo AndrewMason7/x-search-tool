@@ -29,7 +29,10 @@ from x_search.server import server_lifespan
 ISSUER = "https://xsearch.example.test"
 CLIENT_ID = "test-client-id"
 CLIENT_SECRET = "test-client-secret"
-REDIRECT_URI = "https://gemini.google.com/oauth/callback"
+#: Spark completes the flow at Google's own callback origin, which is the only
+#: origin registrations are accepted from.
+REDIRECT_URI = "https://oauth-redirect.googleusercontent.com/r/spark-test"
+OFF_ORIGIN_REDIRECT_URI = "https://evil.example.test/cb"
 INITIALIZE = {
     "jsonrpc": "2.0",
     "id": 1,
@@ -130,10 +133,15 @@ def test_protected_resource_points_at_our_authorization_server(client: TestClien
     assert body["resource"].rstrip("/") == ISSUER
 
 
-def test_authorization_server_metadata_has_endpoints_but_no_registration(
+def test_authorization_server_metadata_advertises_public_client_and_dcr(
     client: TestClient,
 ) -> None:
-    """DCR stays off so clients fall back to the pre-registered credentials."""
+    """The two fields Spark actually gates on.
+
+    ``token_endpoint_auth_methods_supported`` must include ``none`` (Spark is a
+    public client) and ``registration_endpoint`` must be present, or Spark refuses
+    the server with "uses an authentication method that Gemini doesn't support".
+    """
     response = client.get("/.well-known/oauth-authorization-server")
 
     assert response.status_code == 200
@@ -141,7 +149,8 @@ def test_authorization_server_metadata_has_endpoints_but_no_registration(
     assert body["issuer"].rstrip("/") == ISSUER
     assert body["authorization_endpoint"] == f"{ISSUER}/authorize"
     assert body["token_endpoint"] == f"{ISSUER}/token"
-    assert "registration_endpoint" not in body
+    assert body["registration_endpoint"] == f"{ISSUER}/register"
+    assert body["token_endpoint_auth_methods_supported"] == ["none"]
     assert "S256" in body["code_challenge_methods_supported"]
 
 
@@ -304,8 +313,8 @@ def test_unknown_client_id_is_rejected(client: TestClient) -> None:
 # ------------------------------------------------------------------ redirects
 
 
-def test_https_redirect_uri_is_accepted(client: TestClient) -> None:
-    """Spark's Google-hosted callback is not pinned, so any https URI is allowed."""
+def test_allowed_origin_redirect_uri_is_accepted(client: TestClient) -> None:
+    """Any path on a trusted client origin is fine — Spark's callback varies."""
     _, challenge = _pkce_pair()
 
     response = client.get(
@@ -313,7 +322,7 @@ def test_https_redirect_uri_is_accepted(client: TestClient) -> None:
         params={
             "response_type": "code",
             "client_id": CLIENT_ID,
-            "redirect_uri": "https://some.other.origin/cb",
+            "redirect_uri": "https://oauth-redirect.googleusercontent.com/r/other",
             "code_challenge": challenge,
             "code_challenge_method": "S256",
         },
@@ -321,11 +330,13 @@ def test_https_redirect_uri_is_accepted(client: TestClient) -> None:
     )
 
     assert response.status_code == 302
-    assert response.headers["location"].startswith("https://some.other.origin/cb")
+    assert response.headers["location"].startswith(
+        "https://oauth-redirect.googleusercontent.com/r/other"
+    )
 
 
-def test_plain_http_redirect_uri_is_rejected(client: TestClient) -> None:
-    """Authorization codes must never be delivered over plaintext."""
+def test_off_origin_redirect_uri_is_rejected(client: TestClient) -> None:
+    """A code must never be delivered to an origin we do not trust."""
     _, challenge = _pkce_pair()
 
     response = client.get(
@@ -333,7 +344,7 @@ def test_plain_http_redirect_uri_is_rejected(client: TestClient) -> None:
         params={
             "response_type": "code",
             "client_id": CLIENT_ID,
-            "redirect_uri": "http://evil.example.test/cb",
+            "redirect_uri": OFF_ORIGIN_REDIRECT_URI,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
         },
@@ -341,6 +352,123 @@ def test_plain_http_redirect_uri_is_rejected(client: TestClient) -> None:
     )
 
     assert response.status_code == 400
+
+
+# ------------------------------------------------------- dynamic registration
+
+
+def test_dynamic_registration_issues_a_public_client(
+    client: TestClient, provider: XSearchOAuthProvider
+) -> None:
+    """Spark self-registers and the stored client is public, with no secret.
+
+    The registration *response* may still carry a ``client_secret`` because the
+    SDK issues one whenever the request does not ask for ``none``. What matters is
+    the stored client: with no secret and method ``none``, the token endpoint
+    ignores any secret the client sends, so a public client authenticates on PKCE
+    alone either way.
+    """
+    response = client.post(
+        "/register",
+        json={
+            "client_name": "Google",
+            "redirect_uris": [
+                REDIRECT_URI,
+                "https://oauth-redirect.googleusercontent.com/r/other",
+            ],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    client_id = response.json()["client_id"]
+
+    stored = provider._clients[client_id]
+    assert stored.client_secret is None
+    assert stored.token_endpoint_auth_method == "none"
+
+
+def test_dynamic_registration_rejects_off_origin_redirect_uris(client: TestClient) -> None:
+    """Open registration must not become an open redirector."""
+    response = client.post(
+        "/register",
+        json={"client_name": "Not Google", "redirect_uris": [OFF_ORIGIN_REDIRECT_URI]},
+    )
+
+    assert response.status_code == 400
+
+
+def test_dynamic_registration_requires_redirect_uris(client: TestClient) -> None:
+    """A client with nowhere to send the code is useless; refuse it up front."""
+    response = client.post("/register", json={"client_name": "Google"})
+
+    assert response.status_code == 400
+
+
+def test_registered_public_client_completes_the_whole_flow(client: TestClient) -> None:
+    """The end-to-end path Spark takes: register, authorize, PKCE token, MCP call."""
+    registration = client.post(
+        "/register",
+        json={
+            "client_name": "Google",
+            "redirect_uris": [REDIRECT_URI],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+        },
+    )
+    assert registration.status_code == 201, registration.text
+    client_id = registration.json()["client_id"]
+
+    verifier, challenge = _pkce_pair()
+    authorize = client.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": REDIRECT_URI,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": "spark-1",
+            "resource": ISSUER,
+        },
+        follow_redirects=False,
+    )
+    assert authorize.status_code == 302, authorize.text
+    code = authorize.headers["location"].split("code=", 1)[1].split("&", 1)[0]
+
+    # A public client sends no client_secret — PKCE is the only proof.
+    token_response = client.post(
+        "/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": client_id,
+            "code_verifier": verifier,
+            "redirect_uri": REDIRECT_URI,
+        },
+    )
+    assert token_response.status_code == 200, token_response.text
+    access_token = token_response.json()["access_token"]
+
+    call = client.post(
+        "/mcp",
+        json=INITIALIZE,
+        headers={**JSON_HEADERS, "Authorization": f"Bearer {access_token}"},
+    )
+
+    assert call.status_code == 200
+    assert '"name":"x-search"' in call.text
+
+
+def test_root_head_probe_returns_the_auth_challenge(client: TestClient) -> None:
+    """Spark probes HEAD / first; a bare 404 there gives it nothing to work with."""
+    response = client.head("/")
+
+    assert response.status_code == 401
+    challenge = response.headers["www-authenticate"]
+    assert "resource_metadata=" in challenge
+    assert challenge.startswith("Bearer")
 
 
 # -------------------------------------------------------------------- config
