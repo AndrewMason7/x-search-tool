@@ -93,6 +93,42 @@ def _client_for(config: OAuthConfig, provider: XSearchOAuthProvider | None = Non
     return TestClient(build_asgi_app(server, stateless_http=True, oauth_provider=resolved))
 
 
+def test_openid_configuration_mirrors_the_authorization_server_metadata(client: TestClient) -> None:
+    """Spark also asks for OIDC discovery; a 404 there fails URL validation.
+
+    RFC 8414 §5 permits serving the authorization-server metadata at the OIDC
+    well-known location, so the two documents are deliberately identical.
+    """
+    oidc = client.get("/.well-known/openid-configuration")
+
+    assert oidc.status_code == 200
+    assert oidc.json() == client.get("/.well-known/oauth-authorization-server").json()
+    assert oidc.json()["token_endpoint_auth_methods_supported"] == ["none"]
+    assert oidc.json()["registration_endpoint"] == f"{ISSUER}/register"
+
+
+def test_resource_scoped_protected_resource_metadata_is_served(client: TestClient) -> None:
+    """RFC 9728 §3.1: the resource's path may be appended to the well-known prefix.
+
+    Clients that treat the MCP endpoint URL (``…/mcp``) as the resource identifier
+    probe this form, and the SDK registers only the bare prefix.
+    """
+    response = client.get("/.well-known/oauth-protected-resource/mcp")
+
+    assert response.status_code == 200
+    document = response.json()
+    assert document["authorization_servers"] == [f"{ISSUER}/"]
+    assert document["bearer_methods_supported"] == ["header"]
+
+
+def test_bare_protected_resource_prefix_still_answers(client: TestClient) -> None:
+    """The suffixed route must not steal the SDK's bare-prefix document."""
+    response = client.get("/.well-known/oauth-protected-resource")
+
+    assert response.status_code == 200
+    assert response.json()["authorization_servers"] == [f"{ISSUER}/"]
+
+
 def _consent_redirect(
     client: TestClient,
     challenge: str,

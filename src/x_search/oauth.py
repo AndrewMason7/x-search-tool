@@ -930,6 +930,25 @@ def authorization_server_metadata(settings: AuthSettings) -> dict[str, Any]:
     return document
 
 
+def protected_resource_metadata(settings: AuthSettings) -> dict[str, Any]:
+    """Build the RFC 9728 protected-resource document ourselves.
+
+    RFC 9728 §3.1 lets a client derive the metadata URL by appending the
+    resource's own path to ``/.well-known/oauth-protected-resource``. MCP clients
+    try that form when they treat the MCP endpoint URL (``…/mcp``) as the
+    resource identifier, and the SDK only registers the bare prefix because this
+    deployment's ``resource_server_url`` is the issuer root. Serving the same
+    document for any suffixed path stops that probe from 404ing.
+
+    Kept identical to the SDK's own document so both paths answer alike.
+    """
+    return {
+        "resource": str(settings.resource_server_url),
+        "authorization_servers": [str(settings.issuer_url)],
+        "bearer_methods_supported": ["header"],
+    }
+
+
 def describe_client(config: OAuthConfig) -> str:
     """Human-readable credential summary for setup output and the README."""
     return (

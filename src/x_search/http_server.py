@@ -51,7 +51,7 @@ from starlette.responses import (
 from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from x_search.oauth import authorization_server_metadata
+from x_search.oauth import authorization_server_metadata, protected_resource_metadata
 
 logger = logging.getLogger("x_search.http")
 
@@ -541,6 +541,33 @@ def build_asgi_app(
             Route(
                 "/.well-known/oauth-authorization-server",
                 _json_endpoint(authorization_server_metadata(auth_settings)),
+                methods=["GET", "OPTIONS"],
+            ),
+        )
+        # Spark asks for OIDC discovery in addition to the RFC 8414 document. The
+        # SDK registers only the latter, so this path 404s and Spark rejects the
+        # URL with "This isn't a valid MCP link" during validation — before it
+        # ever registers a client. RFC 8414 §5 explicitly permits serving the
+        # authorization-server metadata at the OIDC well-known location, and this
+        # server issues no id_tokens, so no OIDC-only field is advertised.
+        routes.insert(
+            0,
+            Route(
+                "/.well-known/openid-configuration",
+                _json_endpoint(authorization_server_metadata(auth_settings)),
+                methods=["GET", "OPTIONS"],
+            ),
+        )
+        # RFC 9728 §3.1 also allows the resource's own path to be appended to the
+        # well-known prefix, and MCP clients try that form when the MCP endpoint
+        # URL is used as the resource identifier. The SDK registers only the bare
+        # prefix, so answer any suffixed path with the same document. Anchored to
+        # a trailing segment so the SDK's bare-prefix route is left untouched.
+        routes.insert(
+            0,
+            Route(
+                f"{OAUTH_METADATA_PREFIX}/{{rest:path}}",
+                _json_endpoint(protected_resource_metadata(auth_settings)),
                 methods=["GET", "OPTIONS"],
             ),
         )
