@@ -15,11 +15,14 @@ one upstream:
     GET  /sse          -> SSE stream (legacy HTTP+SSE transport)
     POST /messages/    -> SSE client -> server channel
 
-Security is deliberately delegated to the reverse proxy layer: the public URL is
-a capability URL (a high-entropy path segment that Caddy strips before proxying)
-and, where the client can send headers, a bearer token. Passing ``bearer_token``
-here adds that second factor: every request except ``/health`` and the OAuth
-resource-metadata probe must then carry ``Authorization: Bearer <token>``.
+Security is handled at two levels. A reverse proxy can gate the public surface
+(see the README's Gemini Spark section), and when ``X_SEARCH_PUBLIC_URL`` is set
+the MCP server runs its own OAuth 2.1 authorization server
+(:mod:`x_search.oauth`), so every request except ``/health`` must carry a bearer
+token that this server issued. Passing ``bearer_token`` here adds a third, much
+blunter option: a single static token required on every request. It is kept for
+proxies that inject an upstream credential and is incompatible with OAuth (the
+static check runs first and would reject OAuth-issued tokens).
 """
 
 from __future__ import annotations
@@ -194,17 +197,41 @@ def build_asgi_app(
         routes.extend(sse_app.routes)
         transports.append("sse")
 
-    routes.insert(
-        0,
-        Route(
-            f"{OAUTH_METADATA_PREFIX}{{rest:path}}",
-            _oauth_metadata_endpoint,
-            methods=["GET"],
-        ),
-    )
+    # When OAuth is configured the SDK mounts a real RFC 9728 protected-resource
+    # document pointing at our authorization server. That must win: inserting the
+    # "no auth here" stub in front of it would send clients hunting for a
+    # registration endpoint that is deliberately absent.
+    auth_configured = bool(getattr(getattr(mcp, "settings", None), "auth", None))
+    if not auth_configured:
+        routes.insert(
+            0,
+            Route(
+                f"{OAUTH_METADATA_PREFIX}{{rest:path}}",
+                _oauth_metadata_endpoint,
+                methods=["GET"],
+            ),
+        )
     routes.insert(
         0, Route(HEALTH_PATH, _health_endpoint(mcp.name or "x-search", transports), methods=["GET"])
     )
+
+    # The sub-apps carry app-level middleware that must survive the merge. With
+    # OAuth enabled that is Starlette's AuthenticationMiddleware (which is what
+    # populates request.auth for the SDK's RequireAuthMiddleware) plus the auth
+    # context middleware — dropping it turns every authenticated request into a
+    # 401 "Authentication required". Both sub-apps install the same set, so they
+    # are merged by middleware class to avoid stacking duplicates.
+    middleware: list[Any] = []
+    seen_middleware: set[str] = set()
+    for sub_app in (http_app, sse_app):
+        if sub_app is None:
+            continue
+        for entry in sub_app.user_middleware:
+            key = getattr(entry, "cls", type(entry)).__name__
+            if key in seen_middleware:
+                continue
+            seen_middleware.add(key)
+            middleware.append(entry)
 
     # The streamable app owns the only lifespan that matters: it starts and stops
     # the StreamableHTTPSessionManager task group. The SSE app is lifespan-free,
@@ -225,7 +252,7 @@ def build_asgi_app(
             "or supply a non-empty token"
         )
 
-    app: ASGIApp = Starlette(routes=routes, lifespan=lifespan)
+    app: ASGIApp = Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
 
     if bearer_token:
         app = BearerAuthMiddleware(app, bearer_token)

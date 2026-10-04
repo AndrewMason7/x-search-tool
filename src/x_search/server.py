@@ -19,6 +19,7 @@ from x_search.client import (
     XValidationError,
 )
 from x_search.models import Post, PostCountsResponse, SearchResponse
+from x_search.oauth import OAuthConfig, XSearchOAuthProvider, build_auth_settings
 
 
 def configure_logging() -> None:
@@ -64,11 +65,41 @@ async def server_lifespan(server: Any) -> AsyncIterator[None]:
         _client_instance = None
 
 
-mcp = MCPServer(
-    "x-search",
-    description="X (Twitter) recent search, full-archive search, post lookup, and rate limit suite",
-    lifespan=server_lifespan,
-)
+def _build_server() -> MCPServer[Any]:
+    """Construct the MCP server, attaching the OAuth authorization server when configured.
+
+    OAuth only concerns the network transports. It switches on when
+    ``X_SEARCH_PUBLIC_URL`` is set — without it this returns exactly the same
+    unauthenticated server as before, so the stdio transport used by local hosts
+    (Hermes, Claude Desktop, Cursor) is untouched.
+    """
+    oauth_config = OAuthConfig.from_env()
+
+    if oauth_config is None:
+        return MCPServer(
+            "x-search",
+            description="X (Twitter) recent search, full-archive search, post lookup, and rate limit suite",
+            lifespan=server_lifespan,
+        )
+
+    provider = XSearchOAuthProvider(oauth_config)
+    provider.pre_registered_client()
+    logger.info(
+        "OAuth enabled: issuer=%s client_id=%s state=%s",
+        oauth_config.issuer_url,
+        oauth_config.client_id,
+        oauth_config.store_path,
+    )
+    return MCPServer(
+        "x-search",
+        description="X (Twitter) recent search, full-archive search, post lookup, and rate limit suite",
+        lifespan=server_lifespan,
+        auth=build_auth_settings(oauth_config),
+        auth_server_provider=provider,
+    )
+
+
+mcp = _build_server()
 
 _client_instance: XClient | None = None
 

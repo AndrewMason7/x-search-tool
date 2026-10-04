@@ -138,46 +138,86 @@ X_SEARCH_HTTP_TOKEN="$(openssl rand -hex 32)" \
 | `--port` | `X_SEARCH_PORT` | `8091` | Bind port for network transports |
 | `--path` | `X_SEARCH_PATH` | `/mcp` | Streamable-HTTP endpoint path |
 | `--stateless` | `X_SEARCH_STATELESS` | off | Omit `Mcp-Session-Id`; friendlier behind a proxy |
-| `--bearer-token` | `X_SEARCH_HTTP_TOKEN` | unset | Requires `Authorization: Bearer <token>`; an explicitly empty value is rejected rather than silently disabling auth |
+| `--bearer-token` | `X_SEARCH_HTTP_TOKEN` | unset | Requires a static `Authorization: Bearer` token on every request; an explicitly empty value is rejected rather than silently disabling auth. Incompatible with the OAuth layer below |
 
 ### Connecting Google Gemini Spark
 
-Gemini Spark's **Custom apps** feature accepts any HTTPS MCP server URL
-(Settings & help → Connected Apps → Custom apps for Spark → Add a custom app).
-Google's validator probes the root, checks `/.well-known/oauth-protected-resource`,
-then POSTs a JSON-RPC `initialize` — so the endpoint must answer all three.
+Gemini Spark's custom connected apps are **OAuth-only**. When you paste an MCP
+server URL it performs protected-resource discovery (RFC 9728), then
+authorization-server discovery (RFC 8414), then an authorization-code flow with
+PKCE. A server that answers "no authorization server here" is rejected with
+*"This URL does not appear to be a valid MCP server"* — even when its JSON-RPC
+endpoint is perfectly healthy.
 
-This server is not an OAuth resource server, so the practical pattern is a
-**capability URL**: publish a reverse-proxied path containing a high-entropy
-secret, and strip that prefix before the request reaches this process. For
-example, with Caddy:
+Setting `X_SEARCH_PUBLIC_URL` makes this server its own OAuth 2.1 authorization
+server:
+
+```bash
+X_SEARCH_PUBLIC_URL="https://mcp.example.com" \
+X_SEARCH_OAUTH_STORE="$HOME/.config/xsearch-oauth.json" \
+  x-search --transport both --host 127.0.0.1 --port 8091
+```
+
+On first start it generates a client ID and secret and persists them. Read them
+back with:
+
+```bash
+python -c "import json,pathlib; print(json.loads(pathlib.Path('$HOME/.config/xsearch-oauth.json').read_text())['pre_registered_client'])"
+```
+
+Then, in **Settings & help → Connected Apps → Custom apps for Spark → Add a
+custom app**:
+
+| Field | Value |
+|---|---|
+| MCP server URL | `https://mcp.example.com/mcp` |
+| Advanced features → Client ID | the generated `client_id` |
+| Advanced features → Client secret | the generated `client_secret` |
+
+Dynamic Client Registration is deliberately **not** advertised, so Spark falls
+back to those two fields — the path that is verified to work end to end.
+Authorization auto-approves and redirects straight back: the deployment is
+single-tenant and the client is confidential, so possession of the client secret
+*is* the authorization decision, and an authorization code is only redeemable by
+whoever also holds that secret.
+
+If the token exchange fails, client and server disagree about how the secret is
+presented. Switch with `X_SEARCH_OAUTH_TOKEN_AUTH_METHOD=client_secret_basic`
+(default `client_secret_post`).
+
+#### Reverse proxy
+
+Serve the whole origin — MCP *and* OAuth — from one host, because the issuer URL
+in the metadata has to be the URL clients actually reach:
 
 ```caddy
 :8092 {
-    @oauth path /.well-known/oauth-protected-resource*
-    respond @oauth `{}` 200
+    @root_get { method GET; path / }
+    respond @root_get "x-search MCP endpoint" 200
 
-    handle_path /<SECRET>/* {
-        @post_sse { method POST; path /sse }
-        rewrite @post_sse /mcp
-        @post_root { method POST; path / }
-        rewrite @post_root /mcp
-        @get_root { method GET; path / }
-        rewrite @get_root /sse
+    @health path /health
+    respond @health "ok" 200
 
-        reverse_proxy 127.0.0.1:8091 {
-            header_up Accept "application/json, text/event-stream, */*"
-            header_up Authorization "Bearer <X_SEARCH_HTTP_TOKEN>"
-            flush_interval -1
-        }
+    @post_root { method POST; path / }
+    rewrite @post_root /mcp
+
+    @post_sse { method POST; path /sse }
+    rewrite @post_sse /mcp
+
+    reverse_proxy 127.0.0.1:8091 {
+        header_up Accept "application/json, text/event-stream, */*"
+        flush_interval -1
     }
-    respond 404
 }
 ```
 
-Expose port 8092 through a Cloudflare Tunnel to get the HTTPS URL. Note that the
-secret in the URL *is* the credential — anyone holding it can spend your X API
-quota — so rotate it by changing the prefix and re-adding the app in Gemini.
+Expose port 8092 through a Cloudflare Tunnel to get the HTTPS URL. Two
+operational notes:
+
+- Do **not** front this with a WAF rule that blocks non-browser user agents —
+  MCP clients are servers, not browsers.
+- The generated client secret is the credential. Rotate it by deleting the store
+  file and re-adding the app in Gemini.
 
 ---
 
