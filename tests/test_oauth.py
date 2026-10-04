@@ -12,6 +12,7 @@ import base64
 import hashlib
 import secrets
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -71,14 +72,19 @@ def provider(oauth_config: OAuthConfig) -> XSearchOAuthProvider:
 
 @pytest.fixture
 def client(oauth_config: OAuthConfig, provider: XSearchOAuthProvider) -> Iterator[TestClient]:
+    with _client_for(oauth_config, provider) as test_client:
+        yield test_client
+
+
+def _client_for(config: OAuthConfig, provider: XSearchOAuthProvider | None = None) -> TestClient:
+    """Build a TestClient around a fresh server for the given OAuth config."""
     server = MCPServer(
         "x-search",
         lifespan=server_lifespan,
-        auth=build_auth_settings(oauth_config),
-        auth_server_provider=provider,
+        auth=build_auth_settings(config),
+        auth_server_provider=provider or XSearchOAuthProvider(config),
     )
-    with TestClient(build_asgi_app(server, stateless_http=True)) as test_client:
-        yield test_client
+    return TestClient(build_asgi_app(server, stateless_http=True))
 
 
 def _authorize(client: TestClient, challenge: str, state: str = "st-1") -> str:
@@ -209,8 +215,13 @@ def test_authorization_code_is_single_use(client: TestClient) -> None:
     assert response.status_code == 400
 
 
-def test_wrong_client_secret_is_rejected(client: TestClient) -> None:
-    """The client secret is the authorization decision; a wrong one must fail."""
+def test_public_client_exchanges_code_without_a_secret(client: TestClient) -> None:
+    """Spark sends no client_secret — PKCE is the only proof it needs.
+
+    Real Spark token requests carry client_id, code, code_verifier and
+    redirect_uri, and nothing else. A server that demands a secret fails the
+    exchange with a 401 and Spark reports "account linking is required".
+    """
     verifier, challenge = _pkce_pair()
     code = _authorize(client, challenge)
 
@@ -220,13 +231,99 @@ def test_wrong_client_secret_is_rejected(client: TestClient) -> None:
             "grant_type": "authorization_code",
             "code": code,
             "client_id": CLIENT_ID,
-            "client_secret": "not-the-secret",
             "code_verifier": verifier,
             "redirect_uri": REDIRECT_URI,
         },
     )
 
-    assert response.status_code == 401
+    assert response.status_code == 200, response.text
+    assert response.json()["access_token"]
+
+
+def test_confidential_client_must_still_present_its_secret(
+    oauth_config: OAuthConfig, tmp_path: Path
+) -> None:
+    """The public default must not break operators who configure a real secret."""
+    config = replace(oauth_config, token_auth_method="client_secret_post")
+    with _client_for(config) as confidential:
+        verifier, challenge = _pkce_pair()
+        code = _authorize(confidential, challenge)
+
+        without_secret = confidential.post(
+            "/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": CLIENT_ID,
+                "code_verifier": verifier,
+                "redirect_uri": REDIRECT_URI,
+            },
+        )
+        assert without_secret.status_code == 401
+
+        verifier2, challenge2 = _pkce_pair()
+        code2 = _authorize(confidential, challenge2)
+        with_secret = confidential.post(
+            "/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code2,
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "code_verifier": verifier2,
+                "redirect_uri": REDIRECT_URI,
+            },
+        )
+        assert with_secret.status_code == 200
+
+
+def test_sparks_real_redirect_uris_are_accepted(
+    client: TestClient, provider: XSearchOAuthProvider
+) -> None:
+    """Regression: Spark sends six URIs across three googleusercontent hosts.
+
+    The earlier allow-list named only ``oauth-redirect.googleusercontent.com``, so
+    the sandbox and test hosts were rejected, Dynamic Client Registration returned
+    400, and Spark fell back to the manual credentials path.
+    """
+    spark_uris = [
+        f"https://oauth-redirect{env}.googleusercontent.com/r/user_bound_custom-mcp-1-x"
+        for env in ("-sandbox", "-test", "")
+    ] + [
+        f"https://oauth-redirect{env}.googleusercontent.com/a/user_bound_custom-mcp-1-x"
+        for env in ("-sandbox", "-test", "")
+    ]
+
+    response = client.post(
+        "/register",
+        json={
+            "client_name": "Google",
+            "redirect_uris": spark_uris,
+            "response_types": ["code"],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "token_endpoint_auth_method": "none",
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    client_id = response.json()["client_id"]
+    assert provider._clients[client_id].client_secret is None
+
+    # And each of those URIs must also survive authorization-time validation.
+    _, challenge = _pkce_pair()
+    for uri in spark_uris:
+        authorize = client.get(
+            "/authorize",
+            params={
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": uri,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+            },
+            follow_redirects=False,
+        )
+        assert authorize.status_code == 302, (uri, authorize.text)
 
 
 def test_wrong_pkce_verifier_is_rejected(client: TestClient) -> None:

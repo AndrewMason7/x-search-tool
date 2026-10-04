@@ -189,17 +189,20 @@ The MCP SDK hardcodes the first field to the two secret-based methods, so
 #### What keeps open registration safe
 
 Registration is open to anyone, so the gate is the redirect URI. Registrations are
-only accepted from Google-owned origins (`oauth-redirect.googleusercontent.com`
-and `google.com` by default; override with
+only accepted from Google-owned origins — the suffix match covers
+`oauth-redirect.googleusercontent.com`, `oauth-redirect-sandbox.googleusercontent.com`
+and `oauth-redirect-test.googleusercontent.com`, which is where all six of Spark's
+real redirect URIs live (override with
 `X_SEARCH_OAUTH_ALLOWED_REDIRECT_ORIGINS`). A hostile registrant cannot receive
 the authorization code because it does not control that origin, and PKCE — which
 Spark always sends — protects the code even if it leaked. Registered clients are
 stored with **no** client secret and `token_endpoint_auth_method: "none"`.
 
-If the token exchange fails, client and server disagree about how a secret is
-presented. Switch with `X_SEARCH_OAUTH_TOKEN_AUTH_METHOD=client_secret_basic`
-(default `client_secret_post`); this only affects the pre-registered fallback
-client, not dynamically registered public ones.
+Spark is a public client: real traces show it sending `client_id`, `code`,
+`code_verifier` and `redirect_uri` to `/token` and **no client secret**, even when
+it was given one to paste in. The pre-registered client is therefore public by
+default. Set `X_SEARCH_OAUTH_TOKEN_AUTH_METHOD=client_secret_post` (or
+`client_secret_basic`) only if you need a genuinely confidential client.
 
 #### Reverse proxy
 

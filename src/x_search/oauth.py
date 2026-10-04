@@ -64,21 +64,25 @@ AUTHORIZATION_CODE_TTL_SECONDS = 300
 #: callback origin. Restricting registrations to Google-owned origins is what
 #: keeps open Dynamic Client Registration from being an open door: a hostile
 #: registrant cannot receive the authorization code, so its client is inert.
-#: ``oauth-redirect.googleusercontent.com`` is the origin observed in real Spark
-#: traffic; ``google.com`` is included so a change of callback host does not
-#: silently break registration. Override with
+#:
+#: Observed in real Spark traffic, all six of its redirect URIs sit on:
+#:   oauth-redirect.googleusercontent.com
+#:   oauth-redirect-sandbox.googleusercontent.com
+#:   oauth-redirect-test.googleusercontent.com
+#: so the match is on the registrable suffix, not one exact host. Override with
 #: ``X_SEARCH_OAUTH_ALLOWED_REDIRECT_ORIGINS`` (comma-separated).
 DEFAULT_ALLOWED_REDIRECT_ORIGINS = (
-    "oauth-redirect.googleusercontent.com",
+    "googleusercontent.com",
     "google.com",
 )
 
-#: OAuth 2.1 lets a confidential client present its secret either in the request
-#: body (``client_secret_post``) or via HTTP Basic (``client_secret_basic``). The
-#: SDK authenticator picks exactly one based on the registered client, and clients
-#: disagree on which they use, so this is operator-selectable.
-TOKEN_AUTH_METHODS = ("client_secret_post", "client_secret_basic")
-DEFAULT_TOKEN_AUTH_METHOD = "client_secret_post"
+#: Spark is a public client: real traces show it registering with
+#: ``token_endpoint_auth_method: "none"`` and sending **no** client secret even
+#: when it is given one to paste in. Default to public so a secret-less token
+#: exchange succeeds; ``client_secret_post`` / ``client_secret_basic`` remain
+#: available for clients that really do authenticate with a shared secret.
+TOKEN_AUTH_METHODS = ("none", "client_secret_post", "client_secret_basic")
+DEFAULT_TOKEN_AUTH_METHOD = "none"
 
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]"})
 
@@ -132,22 +136,34 @@ def _validate_registration_redirect_uris(
 ) -> None:
     """Reject a registration whose redirect URIs could never receive a code.
 
+    Every rejection is logged with the offending URIs: a client that cannot
+    register typically shows only a generic error in its own UI, so the server log
+    is the only place the real cause is visible.
+
     Raises:
         RegistrationError: If any redirect URI is non-HTTPS or off-origin.
     """
     if not redirect_uris:
+        logger.warning("Rejected client registration: no redirect_uris supplied")
         raise RegistrationError("invalid_redirect_uri", "At least one redirect_uri is required")
 
     for uri in redirect_uris:
         parsed = urlparse(str(uri))
         host = (parsed.hostname or "").lower()
         if parsed.scheme != "https" and host not in LOOPBACK_HOSTS:
+            logger.warning("Rejected client registration: non-HTTPS redirect URI %s", uri)
             raise RegistrationError("invalid_redirect_uri", f"Redirect URI must use https: {uri}")
         if host in LOOPBACK_HOSTS:
             continue
         if allowed_origins and not any(
             host == origin or host.endswith(f".{origin}") for origin in allowed_origins
         ):
+            logger.warning(
+                "Rejected client registration: redirect host %r not in %s (redirect_uris=%s)",
+                host,
+                list(allowed_origins),
+                [str(u) for u in redirect_uris],
+            )
             raise RegistrationError(
                 "invalid_redirect_uri",
                 f"Redirect URI host {host!r} is not permitted on this server",
@@ -329,9 +345,14 @@ class XSearchOAuthProvider(
         restart (a round-trip through JSON would reload it as the base model).
         """
         if self._pre_registered is None:
+            # Spark never sends a client secret — verified in its real token
+            # requests, which carry client_id, code and code_verifier only. So the
+            # pre-registered client is public by default; a secret is only attached
+            # when the operator explicitly selects a secret-based auth method.
+            public = self._config.token_auth_method == "none"
             self._pre_registered = SparkClient(
                 client_id=self._config.client_id,
-                client_secret=self._config.client_secret,
+                client_secret=None if public else self._config.client_secret,
                 client_name=self._config.client_name,
                 redirect_uris=None,
                 token_endpoint_auth_method=self._config.token_auth_method,
