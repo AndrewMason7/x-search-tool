@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import time
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -220,18 +221,27 @@ def _json_endpoint(document: dict[str, Any]) -> Any:
 
 
 def _root_probe_endpoint(mcp: MCPServer[Any]) -> Any:
-    """Answer Spark's bare ``HEAD /`` probe with the MCP 401 challenge.
+    """Answer Spark's probes of the origin root.
 
     Spark treats the URL as a single Streamable-HTTP endpoint and probes the
-    origin root before talking to ``/mcp``. A bare 404 there gives it nothing to
-    work with; the same ``WWW-Authenticate`` the MCP endpoint returns hands it the
-    ``resource_metadata`` pointer straight away.
+    origin root before it will talk to ``/mcp``. Two cases matter:
+
+    - **No token** — a bare 404 gives the client nothing to work with. Return the
+      same 401 challenge the MCP endpoint gives, carrying the ``resource_metadata``
+      pointer, so discovery starts immediately.
+    - **With a valid token** — Spark re-probes the root mid-session as a health
+      check, reusing the token it already holds. Answering 401 there tells it the
+      server it just connected to is no longer valid, so a presented token has to
+      be verified rather than ignored.
     """
 
-    async def probe(_request: Any) -> Response:
+    async def probe(request: Any) -> Response:
         settings = getattr(mcp, "settings", None)
         auth_settings = getattr(settings, "auth", None)
         if auth_settings is None:
+            return Response(status_code=200)
+
+        if await _request_has_valid_token(mcp, request):
             return Response(status_code=200)
 
         resource_url = str(auth_settings.resource_server_url).rstrip("/")
@@ -246,6 +256,37 @@ def _root_probe_endpoint(mcp: MCPServer[Any]) -> Any:
         )
 
     return probe
+
+
+async def _request_has_valid_token(mcp: MCPServer[Any], request: Any) -> bool:
+    """True when the request carries a bearer token this server issued.
+
+    Uses the SDK's own token verifier, which ``MCPServer`` builds from the
+    authorization server provider when one is configured — the same check the MCP
+    endpoints apply, so the root probe can never disagree with them.
+    """
+    header = request.headers.get("authorization", "") if hasattr(request, "headers") else ""
+    if not header.lower().startswith("bearer "):
+        return False
+
+    verifier = getattr(mcp, "_token_verifier", None)
+    if verifier is None:
+        return False
+
+    try:
+        info = await verifier.verify_token(header[7:].strip())
+    except Exception:  # noqa: BLE001 - a malformed token must simply not authenticate
+        logger.warning("Root probe presented a token that failed verification", exc_info=True)
+        return False
+
+    if info is None:
+        return False
+
+    expires_at = getattr(info, "expires_at", None)
+    if expires_at is not None and expires_at < int(time.time()):
+        return False
+
+    return True
 
 
 def build_asgi_app(

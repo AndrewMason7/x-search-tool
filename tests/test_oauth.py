@@ -568,6 +568,29 @@ def test_root_head_probe_returns_the_auth_challenge(client: TestClient) -> None:
     assert challenge.startswith("Bearer")
 
 
+def test_root_head_probe_succeeds_with_a_valid_token(client: TestClient) -> None:
+    """Spark re-probes the root mid-session with the token it already holds.
+
+    Answering 401 there makes it treat the server it just connected to as
+    invalid — the probe has to verify a presented token rather than ignore it.
+    """
+    verifier, challenge = _pkce_pair()
+    code = _authorize(client, challenge)
+    tokens = _exchange(client, code, verifier)
+
+    response = client.head("/", headers={"Authorization": f"Bearer {tokens['access_token']}"})
+
+    assert response.status_code == 200
+
+
+def test_root_head_probe_rejects_a_bogus_token(client: TestClient) -> None:
+    """A token we did not issue must still get the challenge, not a pass."""
+    response = client.head("/", headers={"Authorization": "Bearer not-a-real-token"})
+
+    assert response.status_code == 401
+    assert "resource_metadata=" in response.headers["www-authenticate"]
+
+
 # -------------------------------------------------------------------- config
 
 
