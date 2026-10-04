@@ -16,7 +16,7 @@ An asynchronous Model Context Protocol (MCP) server and Antigravity plugin for s
 - **Hydrated Data:** Automatic resolution of author handles, verified badges, profile pictures, and engagement metrics (likes, reposts, replies, views).
 - **Post Lookup:** Fetch single posts using either numeric status IDs or full URLs (`https://x.com/...` or `https://twitter.com/...`).
 - **Rate Limit Tracking:** Real-time quota tracking (`x-rate-limit-remaining`, `x-rate-limit-reset`) with actionable countdowns and per-endpoint isolation.
-- **FastMCP & stdio:** Built on the official Python MCP SDK with stdio transport.
+- **Official MCP SDK, stdio by default:** Runs over stdin/stdout for local hosts, with optional Streamable-HTTP and SSE transports for remote/web clients (Google Gemini Spark, hosted agents).
 - **Agent Skill & Antigravity Plugin:** Bundled with `plugin.json`, `mcp_config.json`, and `skills/x-search/SKILL.md` for seamless agent workflows.
 
 ---
@@ -104,6 +104,80 @@ Add the following entry to your MCP configuration:
   }
 }
 ```
+
+---
+
+## Remote / Network Deployment (Streamable-HTTP + SSE)
+
+Local hosts launch this server over **stdio**, which is the default and needs no
+configuration. Remote clients cannot spawn a subprocess: they need a public HTTPS
+endpoint speaking JSON-RPC over POST (Streamable-HTTP) or Server-Sent Events.
+
+```bash
+# Streamable-HTTP + SSE on one port, no auth (put a reverse proxy in front)
+x-search --transport both --host 127.0.0.1 --port 8091
+
+# Same, but every request must carry a bearer token
+X_SEARCH_HTTP_TOKEN="$(openssl rand -hex 32)" \
+  x-search --transport both --host 127.0.0.1 --port 8091
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /mcp` | Streamable-HTTP JSON-RPC (the modern transport) |
+| `GET /sse`, `POST /messages/` | Legacy HTTP+SSE transport |
+| `GET /health` | Liveness probe, always unauthenticated |
+| `GET /.well-known/oauth-protected-resource` | RFC 9728 probe, answered with `{}` so clients stop probing |
+
+### Options
+
+| Flag | Env var | Default | Notes |
+|---|---|---|---|
+| `--transport` | `X_SEARCH_TRANSPORT` | `stdio` | `stdio`, `sse`, `streamable-http`, or `both` |
+| `--host` | `X_SEARCH_HOST` | `127.0.0.1` | Bind address for network transports |
+| `--port` | `X_SEARCH_PORT` | `8091` | Bind port for network transports |
+| `--path` | `X_SEARCH_PATH` | `/mcp` | Streamable-HTTP endpoint path |
+| `--stateless` | `X_SEARCH_STATELESS` | off | Omit `Mcp-Session-Id`; friendlier behind a proxy |
+| `--bearer-token` | `X_SEARCH_HTTP_TOKEN` | unset | Requires `Authorization: Bearer <token>`; an explicitly empty value is rejected rather than silently disabling auth |
+
+### Connecting Google Gemini Spark
+
+Gemini Spark's **Custom apps** feature accepts any HTTPS MCP server URL
+(Settings & help → Connected Apps → Custom apps for Spark → Add a custom app).
+Google's validator probes the root, checks `/.well-known/oauth-protected-resource`,
+then POSTs a JSON-RPC `initialize` — so the endpoint must answer all three.
+
+This server is not an OAuth resource server, so the practical pattern is a
+**capability URL**: publish a reverse-proxied path containing a high-entropy
+secret, and strip that prefix before the request reaches this process. For
+example, with Caddy:
+
+```caddy
+:8092 {
+    @oauth path /.well-known/oauth-protected-resource*
+    respond @oauth `{}` 200
+
+    handle_path /<SECRET>/* {
+        @post_sse { method POST; path /sse }
+        rewrite @post_sse /mcp
+        @post_root { method POST; path / }
+        rewrite @post_root /mcp
+        @get_root { method GET; path / }
+        rewrite @get_root /sse
+
+        reverse_proxy 127.0.0.1:8091 {
+            header_up Accept "application/json, text/event-stream, */*"
+            header_up Authorization "Bearer <X_SEARCH_HTTP_TOKEN>"
+            flush_interval -1
+        }
+    }
+    respond 404
+}
+```
+
+Expose port 8092 through a Cloudflare Tunnel to get the HTTPS URL. Note that the
+secret in the URL *is* the credential — anyone holding it can spend your X API
+quota — so rotate it by changing the prefix and re-adding the app in Gemini.
 
 ---
 
