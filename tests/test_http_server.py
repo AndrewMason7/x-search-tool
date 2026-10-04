@@ -222,3 +222,56 @@ async def test_auth_debug_middleware_redacts_secrets() -> None:
     assert "authorization_scheme" in joined and "Basic" in joined
     assert "-> 400" in joined
     assert sent and sent[0]["status"] == 400
+
+
+async def test_auth_debug_middleware_rejects_payload_too_large() -> None:
+    """The debug logger must terminate streams that exceed MAX_AUTH_BODY_BYTES."""
+    sent: list[dict] = []
+
+    async def inner(scope, receive, send):  # type: ignore[no-untyped-def]
+        pass
+
+    async def receive():  # type: ignore[no-untyped-def]
+        return {
+            "type": "http.request",
+            "body": b"x" * 70000,
+            "more_body": False,
+        }
+
+    async def send(message):  # type: ignore[no-untyped-def]
+        sent.append(message)
+
+    middleware = AuthDebugMiddleware(inner)
+    await middleware(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/token",
+            "query_string": b"",
+            "headers": [],
+        },
+        receive,
+        send,
+    )
+    assert sent and sent[0]["status"] == 413
+
+
+@pytest.mark.asyncio
+async def test_asgi_app_lifespan_cleans_up(mcp: MCPServer) -> None:
+    """The lifespan context manager must gracefully enter and exit, invoking provider teardown."""
+    from unittest.mock import AsyncMock
+
+    mock_provider = AsyncMock()
+    app = build_asgi_app(
+        mcp,
+        enable_streamable_http=True,
+        bearer_token=None,
+        oauth_provider=mock_provider,
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/mcp", json=INITIALIZE, headers=JSON_HEADERS)
+        assert response.status_code == 200
+
+    mock_provider.aclose.assert_awaited_once()
+

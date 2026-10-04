@@ -35,7 +35,7 @@ import time
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 from mcp.server.auth.provider import AuthorizeError
 from mcp.server.mcpserver import MCPServer
@@ -131,6 +131,9 @@ DEBUGGED_AUTH_PATHS = frozenset({"/authorize", "/token", "/register"})
 _SECRET_FIELDS = ("client_secret", "code", "code_verifier", "refresh_token", "assertion")
 
 
+MAX_AUTH_BODY_BYTES = 64 * 1024  # 64 KB
+
+
 class AuthDebugMiddleware:
     """Log the shape (never the values) of OAuth requests.
 
@@ -154,7 +157,18 @@ class AuthDebugMiddleware:
             message = await receive()
             if message["type"] != "http.request":
                 break
-            body.extend(message.get("body", b""))
+            chunk = message.get("body", b"")
+            body.extend(chunk)
+            if len(body) > MAX_AUTH_BODY_BYTES:
+                logger.warning(
+                    "AUTH DEBUG: request body exceeded %d bytes on %s %s; aborting",
+                    MAX_AUTH_BODY_BYTES,
+                    scope.get("method"),
+                    scope.get("path"),
+                )
+                response = PlainTextResponse("Payload Too Large\n", status_code=413)
+                await response(scope, receive, send)
+                return
             if not message.get("more_body", False):
                 break
 
@@ -228,14 +242,24 @@ def _json_endpoint(document: dict[str, Any]) -> Any:
     return endpoint
 
 
-def _consent_html(client_name: str, request_id: str, error: str | None) -> str:
+def _consent_html(
+    client_name: str,
+    request_id: str,
+    csrf_token: str | None = None,
+    error: str | None = None,
+) -> str:
     """Render the approval page.
 
     Deliberately dependency-free: it is a handful of lines of HTML and a form, so
     there is no template engine to keep in sync and nothing to escape beyond the
-    two interpolated values.
+    interpolated values.
     """
     error_block = f'<p class="err">{html.escape(error)}</p>' if error else ""
+    csrf_field = (
+        f'    <input type="hidden" name="csrf" value="{html.escape(csrf_token)}">\n'
+        if csrf_token
+        else ""
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -260,7 +284,7 @@ def _consent_html(client_name: str, request_id: str, error: str | None) -> str:
   <p>Enter the approval secret for this deployment to allow it.</p>
   <form method="post" action="/consent">
     <input type="hidden" name="req" value="{html.escape(request_id)}">
-    <label for="consent_secret">Approval secret</label>
+{csrf_field}    <label for="consent_secret">Approval secret</label>
     <input id="consent_secret" name="consent_secret" type="password"
            autocomplete="off" autofocus required>
     <button type="submit">Approve</button>
@@ -275,33 +299,67 @@ def _consent_endpoints(provider: Any) -> tuple[Any, Any]:
 
     async def page(request: Any) -> HTMLResponse:
         request_id = request.query_params.get("req", "")
-        params = await provider.pending_authorization(request_id)
-        if params is None:
+        consent = await provider.pending_authorization(request_id)
+        if consent is None:
             return HTMLResponse(
                 _consent_html(
                     "This request",
                     request_id,
-                    "This approval link has expired or was already used. Start the "
-                    "connection again from your client.",
+                    None,
+                    "This approval link has expired, was locked out, or was already used. "
+                    "Start the connection again from your client.",
                 ),
                 status_code=400,
             )
-        return HTMLResponse(_consent_html(provider.client_name, request_id, None))
+        csrf_token = getattr(consent, "csrf_token", None)
+        return HTMLResponse(_consent_html(provider.client_name, request_id, csrf_token, None))
 
     async def submit(request: Any) -> Response:
+        # Cross-Site Request Forgery (CSRF) defenses
+        sec_fetch_site = request.headers.get("sec-fetch-site", "").lower()
+        if sec_fetch_site == "cross-site":
+            logger.warning("Rejected cross-site POST to /consent (Sec-Fetch-Site: cross-site)")
+            return PlainTextResponse("Forbidden: Cross-site request rejected\n", status_code=403)
+
+        origin = request.headers.get("origin")
+        if origin:
+            parsed_origin = urlparse(origin)
+            issuer_url = getattr(getattr(provider, "_config", None), "issuer_url", "")
+            if issuer_url:
+                issuer_parsed = urlparse(issuer_url)
+                origin_host = (parsed_origin.hostname or "").lower()
+                issuer_host = (issuer_parsed.hostname or "").lower()
+                is_loopback = (
+                    origin_host in {"localhost", "127.0.0.1", "::1"}
+                    and issuer_host in {"localhost", "127.0.0.1", "::1"}
+                )
+                if (
+                    parsed_origin.scheme != issuer_parsed.scheme
+                    or parsed_origin.netloc != issuer_parsed.netloc
+                ) and not is_loopback:
+                    logger.warning("Rejected cross-origin POST to /consent from origin: %s", origin)
+                    return PlainTextResponse(
+                        "Forbidden: Cross-origin request rejected\n", status_code=403
+                    )
+
         form = await request.form()
         request_id = str(form.get("req", ""))
         consent_secret = str(form.get("consent_secret", ""))
+        csrf_token = str(form.get("csrf", "")) if "csrf" in form else None
 
         try:
-            redirect_url = await provider.approve_authorization(request_id, consent_secret)
+            redirect_url = await provider.approve_authorization(
+                request_id, consent_secret, csrf_token=csrf_token
+            )
         except AuthorizeError as exc:
-            params = await provider.pending_authorization(request_id)
-            status = 403 if params is not None else 400
+            consent = await provider.pending_authorization(request_id)
+            status = 403 if consent is not None else 400
+            csrf = getattr(consent, "csrf_token", None) if consent is not None else None
             return HTMLResponse(
                 _consent_html(
                     provider.client_name,
                     request_id,
+                    csrf,
                     f"Approval failed: {exc.error_description or exc.error}",
                 ),
                 status_code=status,
@@ -532,11 +590,34 @@ def build_asgi_app(
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
-        if http_router is None:
-            yield
-            return
-        async with http_router.lifespan_context(app):
-            yield
+        mcp_lifespan_fn = getattr(getattr(mcp, "settings", None), "lifespan", None)
+
+        @asynccontextmanager
+        async def _run_mcp() -> AsyncIterator[None]:
+            if mcp_lifespan_fn is not None:
+                async with mcp_lifespan_fn(mcp):
+                    yield
+            else:
+                yield
+
+        @asynccontextmanager
+        async def _run_http() -> AsyncIterator[None]:
+            if http_router is not None:
+                async with http_router.lifespan_context(app):
+                    yield
+            else:
+                yield
+
+        try:
+            async with _run_mcp():
+                async with _run_http():
+                    yield
+        finally:
+            if oauth_provider is not None and hasattr(oauth_provider, "aclose"):
+                try:
+                    await oauth_provider.aclose()
+                except Exception:
+                    logger.warning("Error draining OAuth provider on shutdown", exc_info=True)
 
     if bearer_token is not None and not bearer_token.strip():
         raise ValueError(

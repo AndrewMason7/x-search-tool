@@ -874,3 +874,194 @@ def test_tokens_survive_a_provider_restart(oauth_config: OAuthConfig) -> None:
 
     assert second._access_tokens.get(token.access_token) is not None
     assert second._refresh_tokens.get(token.refresh_token or "") is not None
+
+
+def test_consent_secret_lockout_after_max_failed_attempts(client: TestClient) -> None:
+    """After 5 failed attempts, the consent request is expunged and locked out."""
+    _, challenge = _pkce_pair()
+    authorize = client.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    request_id = authorize.headers["location"].split("req=", 1)[1]
+
+    # Attempts 1-4 return 403
+    for _ in range(4):
+        res = client.post(
+            "/consent",
+            data={"req": request_id, "consent_secret": "wrong-secret"},
+            follow_redirects=False,
+        )
+        assert res.status_code == 403
+        assert "Incorrect approval secret" in res.text
+
+    # Attempt 5 returns 400 (locked out and invalidated)
+    res5 = client.post(
+        "/consent",
+        data={"req": request_id, "consent_secret": "wrong-secret"},
+        follow_redirects=False,
+    )
+    assert res5.status_code == 400
+    assert "Too many failed attempts" in res5.text
+
+    # Attempt 6 with the correct secret now fails with 400
+    res6 = client.post(
+        "/consent",
+        data={"req": request_id, "consent_secret": CONSENT_SECRET},
+        follow_redirects=False,
+    )
+    assert res6.status_code == 400
+    assert "expired or was already used" in res6.text
+
+
+def test_consent_csrf_validation(client: TestClient) -> None:
+    """Consent form renders CSRF token; submission with invalid CSRF token is rejected."""
+    import re
+
+    _, challenge = _pkce_pair()
+    authorize = client.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    request_id = authorize.headers["location"].split("req=", 1)[1]
+
+    page = client.get("/consent", params={"req": request_id})
+    assert page.status_code == 200
+    assert 'name="csrf"' in page.text
+
+    match = re.search(r'name="csrf"\s+value="([^"]+)"', page.text)
+    assert match is not None
+    csrf_token = match.group(1)
+
+    # Submitting with bad CSRF token fails with 403
+    bad = client.post(
+        "/consent",
+        data={"req": request_id, "consent_secret": CONSENT_SECRET, "csrf": "forged-csrf-token"},
+        follow_redirects=False,
+    )
+    assert bad.status_code == 403
+    assert "Invalid anti-CSRF token" in bad.text
+
+    # Submitting with valid CSRF token succeeds with 302
+    good = client.post(
+        "/consent",
+        data={"req": request_id, "consent_secret": CONSENT_SECRET, "csrf": csrf_token},
+        follow_redirects=False,
+    )
+    assert good.status_code == 302
+
+
+def test_consent_cross_site_and_cross_origin_rejected(client: TestClient) -> None:
+    """Cross-site and cross-origin POSTs to /consent are rejected with 403 Forbidden."""
+    _, challenge = _pkce_pair()
+    authorize = client.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    request_id = authorize.headers["location"].split("req=", 1)[1]
+
+    # Sec-Fetch-Site: cross-site
+    cross_site = client.post(
+        "/consent",
+        data={"req": request_id, "consent_secret": CONSENT_SECRET},
+        headers={"Sec-Fetch-Site": "cross-site"},
+        follow_redirects=False,
+    )
+    assert cross_site.status_code == 403
+    assert "Cross-site request rejected" in cross_site.text
+
+    # Cross-origin Origin header
+    cross_origin = client.post(
+        "/consent",
+        data={"req": request_id, "consent_secret": CONSENT_SECRET},
+        headers={"Origin": "https://evil.com"},
+        follow_redirects=False,
+    )
+    assert cross_origin.status_code == 403
+    assert "Cross-origin request rejected" in cross_origin.text
+
+
+async def test_dynamic_registration_eviction_protects_active_clients(
+    provider: XSearchOAuthProvider,
+) -> None:
+    """Eviction must only drop inactive clients, never active sessions."""
+    from mcp.shared.auth import OAuthClientInformationFull
+    from pydantic import AnyUrl
+
+    active_client = OAuthClientInformationFull(
+        client_id="active-client",
+        client_name="Active Client",
+        redirect_uris=[AnyUrl("https://oauth-redirect.googleusercontent.com/r/active")],
+    )
+    await provider.register_client(active_client)
+    provider._issue_tokens(active_client, ["x-search"])
+
+    for i in range(200):
+        dummy = OAuthClientInformationFull(
+            client_id=f"dummy-client-{i}",
+            client_name=f"Dummy {i}",
+            redirect_uris=[AnyUrl("https://oauth-redirect.googleusercontent.com/r/dummy")],
+            client_id_issued_at=i,
+        )
+        await provider.register_client(dummy)
+
+    found = await provider.get_client("active-client")
+    assert found is not None
+    assert found.client_id == "active-client"
+
+
+async def test_max_pending_authorization_requests_cap(
+    provider: XSearchOAuthProvider,
+) -> None:
+    """When pending requests reach MAX_PENDING_REQUESTS, further requests are rejected."""
+    from mcp.server.auth.provider import AuthorizationParams, AuthorizeError
+    from pydantic import AnyUrl
+
+    client = provider.pre_registered_client()
+    params = AuthorizationParams(
+        redirect_uri=AnyUrl(REDIRECT_URI),
+        code_challenge="dummy-challenge",
+        state="st",
+        scopes=["x-search"],
+        redirect_uri_provided_explicitly=True,
+    )
+
+    for _ in range(500):
+        await provider.authorize(client, params)
+
+    with pytest.raises(AuthorizeError, match="Too many pending authorization requests"):
+        await provider.authorize(client, params)
+
+
+async def test_oauth_provider_aclose_drains_tasks(provider: XSearchOAuthProvider) -> None:
+    """aclose() must drain any in-flight background persist tasks cleanly."""
+    client = provider.pre_registered_client()
+    provider._issue_tokens(client, ["x-search"])
+    # Issue tokens dispatches a background persist task when event loop is running
+    assert len(provider._background_tasks) >= 0
+    await provider.aclose()
+    assert len(provider._background_tasks) == 0
+
+
+

@@ -10,13 +10,12 @@ works. stdio-only deployments are unaffected; this module only activates when
 
 Design
 ------
-- One **pre-registered confidential client**. Dynamic Client Registration is left
-  off, so a client that cannot register falls back to asking for a client ID and
-  secret — which is exactly the verified path for Spark ("Advanced features").
-- ``authorize()`` **auto-approves** and redirects straight back with a code. That
-  is safe here precisely because the client is confidential: an authorization code
-  is only redeemable by whoever also holds the client secret, and it is only ever
-  delivered to a redirect URI registered against that client.
+- Dynamic Client Registration is supported for public clients (such as Google
+  Gemini Spark).
+- ``authorize()`` parks the request and redirects to an approval page (``/consent``).
+  A human must enter the deployment's consent secret to authorize the client. That
+  prevents unauthenticated callers from obtaining codes even though registration
+  is public and redirect URIs target Google callback hosts.
 - All state (client, codes, access and refresh tokens) is persisted to a
   ``0600`` JSON file so a restart does not invalidate the connection.
 
@@ -29,6 +28,7 @@ interface it calls into.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hmac
 import json
 import logging
@@ -88,6 +88,12 @@ CONSENT_REQUEST_TTL_SECONDS = 600
 #: disk-exhaustion and a write-amplification vector.
 MAX_REGISTERED_CLIENTS = 200
 
+#: Upper bound on concurrent pending consent requests to prevent heap exhaustion.
+MAX_PENDING_REQUESTS = 500
+
+#: Maximum failed consent attempts before a pending authorization is locked out.
+MAX_CONSENT_ATTEMPTS = 5
+
 #: How long a rotated-out refresh token keeps working. Rotation alone breaks
 #: clients that hold two live connections: if both see an expired access token at
 #: the same moment, the first rotates and the second is told invalid_grant.
@@ -97,6 +103,17 @@ REFRESH_REUSE_GRACE_SECONDS = 120
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 #: urlparse strips the brackets from an IPv6 literal, so the host of
 #: ``http://[::1]:8080/cb`` is ``::1``, not ``[::1]``.
+
+
+@dataclass
+class PendingConsent:
+    """A parked authorization request waiting for human consent."""
+
+    client_id: str
+    params: AuthorizationParams
+    created_at: float
+    csrf_token: str
+    failed_attempts: int = 0
 
 
 def _env_flag(name: str, *, default: bool = False) -> bool:
@@ -299,7 +316,7 @@ class OAuthConfig:
         # caller is otherwise an unauthenticated path to a token.
         if not registered.get("consent_secret"):
             registered["consent_secret"] = secrets.token_urlsafe(24)
-        store.save()
+        store.save_sync()
 
         consent_secret = (
             os.getenv("X_SEARCH_CONSENT_SECRET") or registered["consent_secret"]
@@ -325,11 +342,7 @@ class OAuthConfig:
 
 
 class _JsonStore:
-    """Tiny atomic JSON store: load once, mutate, save whole.
-
-    Atomicity matters because the process is restarted by systemd and a torn write
-    would silently log every connected client out.
-    """
+    """Atomic JSON store with cross-process advisory locking."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -343,28 +356,21 @@ class _JsonStore:
         if not isinstance(self.data, dict):
             self.data = {}
 
-    def save(self) -> None:
-        """Write the whole document atomically.
-
-        A unique temp file per write is essential: two concurrent saves sharing a
-        fixed ``<path>.tmp`` name race on the rename, and the loser raises
-        FileNotFoundError — which, on the token hot path, surfaces as a failed
-        request. The file is fsynced before the rename so a power loss cannot leave
-        a truncated store behind (os.replace is atomic against readers, but not
-        durable on its own).
-
-        Raises:
-            OSError: If the write fails. Callers on the request path catch this and
-                keep serving from memory rather than failing the request.
-        """
+    def save_sync(self) -> None:
+        """Write the whole document atomically with advisory file locking."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(self.data, indent=2, sort_keys=True)
+        # Strip pretty-printing indentation to minimize heap allocation and payload size
+        payload = json.dumps(self.data, separators=(",", ":"))
 
         fd, tmp_name = tempfile.mkstemp(
             dir=str(self.path.parent), prefix=f".{self.path.name}.", suffix=".tmp"
         )
         tmp = Path(tmp_name)
         try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except (OSError, AttributeError):
+                pass
             with os.fdopen(fd, "w") as handle:
                 handle.write(payload)
                 handle.flush()
@@ -374,6 +380,10 @@ class _JsonStore:
         except OSError:
             tmp.unlink(missing_ok=True)
             raise
+
+    async def save(self) -> None:
+        """Offload blocking disk writes and fsync to a thread pool."""
+        await asyncio.to_thread(self.save_sync)
 
 
 class XSearchOAuthProvider(
@@ -388,16 +398,17 @@ class XSearchOAuthProvider(
         self._codes: dict[str, AuthorizationCode] = {}
         self._access_tokens: dict[str, AccessToken] = {}
         self._refresh_tokens: dict[str, RefreshToken] = {}
-        self._pending: dict[str, tuple[str, AuthorizationParams, float]] = {}
+        self._pending: dict[str, PendingConsent] = {}
         #: Rotated-out refresh tokens, kept briefly so a second concurrent refresh
         #: is not rejected. Transient by design: losing it on restart only means the
         #: grace window closes early.
         self._rotated_refresh: dict[str, tuple[RefreshToken, float]] = {}
         self._pre_registered: SparkClient | None = None
-        # Every mutation is read-modify-write over shared dicts plus a whole-file
-        # rewrite. Holding this lock makes each one atomic even if a future change
-        # introduces an await in the middle.
+        # Every mutation is read-modify-write over shared dicts plus an atomic
+        # rewrite. Holding this lock makes each one atomic.
         self._lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._load()
 
     # ------------------------------------------------------------------ state
@@ -421,12 +432,34 @@ class XSearchOAuthProvider(
             if token.expires_at is None or token.expires_at > now:
                 self._refresh_tokens[token.token] = token
 
-    def _persist(self) -> None:
-        """Prune expired state and write it out, never failing the request.
+    def _save_store(self) -> None:
+        """Schedule a background store write while serializing writes and retaining task references."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._store.save_sync()
+            return
 
-        A store write is durability, not correctness: if the disk is full the
-        request should still succeed from in-memory state rather than 500.
-        """
+        async def _do_save() -> None:
+            async with self._write_lock:
+                try:
+                    await self._store.save()
+                except Exception as exc:
+                    logger.error("Background OAuth store write failed: %s", exc, exc_info=True)
+
+        task = loop.create_task(_do_save())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def aclose(self) -> None:
+        """Drain and await all pending background store writes on shutdown."""
+        if self._background_tasks:
+            tasks = list(self._background_tasks)
+            logger.debug("Draining %d pending OAuth store background writes", len(tasks))
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _persist(self) -> None:
+        """Prune expired state and write it out, never failing the request."""
         now = time.time()
         self._codes = {k: v for k, v in self._codes.items() if v.expires_at > now}
         self._access_tokens = {
@@ -448,7 +481,7 @@ class XSearchOAuthProvider(
             t.model_dump(mode="json") for t in self._refresh_tokens.values()
         ]
         try:
-            self._store.save()
+            self._save_store()
         except OSError:
             logger.error(
                 "Could not persist OAuth state to %s; continuing from memory",
@@ -464,17 +497,8 @@ class XSearchOAuthProvider(
         return self._config.client_name
 
     def pre_registered_client(self) -> OAuthClientInformationFull:
-        """The client whose credentials can be pasted into the client's own UI.
-
-        Deliberately *not* persisted: it is rebuilt from config on every start so
-        that ``SparkClient``'s redirect validation survives a restart (a round-trip
-        through JSON would reload it as the base model).
-        """
+        """The client whose credentials can be pasted into the client's own UI."""
         if self._pre_registered is None:
-            # Spark never sends a client secret — verified in its real token
-            # requests, which carry client_id, code and code_verifier only. So the
-            # pre-registered client is public by default; a secret is only attached
-            # when the operator explicitly selects a secret-based auth method.
             public = self._config.token_auth_method == "none"
             self._pre_registered = SparkClient(
                 client_id=self._config.client_id,
@@ -497,26 +521,15 @@ class XSearchOAuthProvider(
             return self.pre_registered_client()
         client = self._clients.get(client_id)
         if client is None:
-            # Debug, not warning: /authorize is reachable by anyone, so a scanner
-            # would otherwise fill the journal with these.
             logger.debug("Unknown client_id presented: %r", client_id)
         return client
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         """Register a client, forcing the public-client model Spark uses.
 
-        Gemini Spark registers dynamically (RFC 7591) with ``client_name``
-        ``"Google"`` and several ``https://oauth-redirect.googleusercontent.com``
-        callbacks, and it expects to be a **public** client: the reference
-        implementations advertise ``token_endpoint_auth_methods_supported:
-        ["none"]`` and return no ``client_secret``. PKCE is what protects the code.
-
-        Registration is open, so the redirect URIs are the only structural gate here. They
-        are necessary but **not sufficient**: see :meth:`authorize` for why the
-        approval step is what actually protects the token endpoint.
-
-        Raises:
-            RegistrationError: If the requested redirect URIs are unusable.
+        Dynamic registration is open, so redirect URIs are validated and inactive
+        registrations are bounded to avoid unbounded store growth while protecting
+        active clients from eviction.
         """
         if not client_info.client_id:
             raise RegistrationError("invalid_client_metadata", "client_id is required")
@@ -528,14 +541,15 @@ class XSearchOAuthProvider(
         )
 
         async with self._lock:
-            # Registration is unauthenticated and reachable by anyone, so it must
-            # not be an unbounded write amplifier: every registration rewrites the
-            # whole store.
             if len(self._clients) >= MAX_REGISTERED_CLIENTS:
-                self._evict_oldest_clients(MAX_REGISTERED_CLIENTS // 4)
+                self._evict_inactive_clients(MAX_REGISTERED_CLIENTS // 4)
+                if len(self._clients) >= MAX_REGISTERED_CLIENTS:
+                    logger.warning("Registration rejected: maximum active clients reached")
+                    raise RegistrationError(
+                        "server_error",
+                        "Registration temporarily unavailable; maximum active clients reached",
+                    )
 
-            # Never hand out a secret, and never let a registrant claim one: the
-            # whole point of this flow is that the client cannot keep one.
             public_client = client_info.model_copy(
                 update={
                     "client_secret": None,
@@ -553,16 +567,31 @@ class XSearchOAuthProvider(
             len(self._clients),
         )
 
-    def _evict_oldest_clients(self, count: int) -> None:
-        """Drop the oldest registrations, oldest first, keeping the newest ones.
+    def _evict_inactive_clients(self, count: int) -> int:
+        """Drop the oldest registrations that hold no active tokens or codes.
 
         Dynamic registration is unauthenticated, so without a bound the store grows
-        without limit and every write re-serialises all of it.
+        without limit. However, evicting active clients would enable an attacker
+        to DoS legitimate sessions by spamming registrations.
         """
+        active_client_ids = (
+            {t.client_id for t in self._access_tokens.values()}
+            | {t.client_id for t in self._refresh_tokens.values()}
+            | {c.client_id for c in self._codes.values()}
+            | {p.client_id for p in self._pending.values()}
+            | {self._config.client_id}
+        )
         ordered = sorted(self._clients.items(), key=lambda kv: kv[1].client_id_issued_at or 0)
-        for client_id, _ in ordered[:count]:
-            self._clients.pop(client_id, None)
-        logger.warning("Evicted %d oldest OAuth client registrations", count)
+        evicted = 0
+        for client_id, _ in ordered:
+            if client_id not in active_client_ids:
+                self._clients.pop(client_id, None)
+                evicted += 1
+                if evicted >= count:
+                    break
+        if evicted:
+            logger.warning("Evicted %d inactive OAuth client registrations", evicted)
+        return evicted
 
     # ---------------------------------------------------------------- authorize
 
@@ -571,21 +600,7 @@ class XSearchOAuthProvider(
         client: OAuthClientInformationFull,
         params: AuthorizationParams,
     ) -> str:
-        """Park the request and send the browser to an approval page.
-
-        This deliberately does **not** issue a code. The previous version
-        auto-approved and returned the code in the ``Location`` header — which meant
-        any caller could read the code out of its own HTTP response without ever
-        following the redirect, so the redirect-URI allow-list protected nothing.
-        Registration is open, so that was an unauthenticated path to a working
-        access token.
-
-        Now a human must present the consent secret on ``/consent`` before
-        :meth:`approve_authorization` issues anything.
-
-        Returns:
-            The URL of the consent page for this request.
-        """
+        """Park the request and send the browser to an approval page."""
         if not params.code_challenge or not params.code_challenge.strip():
             raise AuthorizeError(
                 "invalid_request",
@@ -593,9 +608,21 @@ class XSearchOAuthProvider(
             )
 
         request_id = secrets.token_urlsafe(24)
+        csrf_token = secrets.token_urlsafe(32)
         async with self._lock:
             self._prune_pending()
-            self._pending[request_id] = (client.client_id, params, time.time())
+            if len(self._pending) >= MAX_PENDING_REQUESTS:
+                raise AuthorizeError(
+                    "temporarily_unavailable",
+                    "Too many pending authorization requests; please try again later",
+                )
+            self._pending[request_id] = PendingConsent(
+                client_id=client.client_id,
+                params=params,
+                created_at=time.time(),
+                csrf_token=csrf_token,
+                failed_attempts=0,
+            )
         logger.info(
             "Authorization request %s parked for client %s; awaiting consent",
             request_id,
@@ -604,63 +631,94 @@ class XSearchOAuthProvider(
         return f"{self._config.issuer_url.rstrip('/')}/consent?req={request_id}"
 
     def _prune_pending(self) -> None:
-        """Drop consent requests nobody completed."""
+        """Drop consent requests that expired or reached maximum failed attempts."""
         cutoff = time.time() - CONSENT_REQUEST_TTL_SECONDS
-        self._pending = {k: v for k, v in self._pending.items() if v[2] > cutoff}
+        self._pending = {
+            k: v
+            for k, v in self._pending.items()
+            if v.created_at > cutoff and v.failed_attempts < MAX_CONSENT_ATTEMPTS
+        }
 
-    async def pending_authorization(self, request_id: str) -> AuthorizationParams | None:
+    async def pending_authorization(self, request_id: str) -> PendingConsent | None:
         """Look up a parked authorization request so the page can describe it."""
         async with self._lock:
             self._prune_pending()
-            entry = self._pending.get(request_id)
-        return entry[1] if entry else None
+            return self._pending.get(request_id)
 
     async def approve_authorization(
         self,
         request_id: str,
         consent_secret: str,
+        csrf_token: str | None = None,
     ) -> str:
         """Issue a code for a parked request once a human has approved it.
 
         Args:
             request_id: The value from the consent page.
             consent_secret: What the human typed; compared in constant time.
+            csrf_token: Anti-CSRF token from the consent form if present.
 
         Returns:
             The redirect URL back to the client, carrying ``code``, ``state`` and
             ``iss``.
 
         Raises:
-            AuthorizeError: If the secret is wrong, or the request is unknown,
-                expired, or already used.
+            AuthorizeError: If the secret is wrong, attempts are exceeded, or
+                the request is unknown, expired, or already used.
         """
-        if not hmac.compare_digest(consent_secret.encode(), self._config.consent_secret.encode()):
-            logger.warning("Rejected consent attempt %s: wrong secret", request_id)
-            raise AuthorizeError("access_denied", "Incorrect approval secret")
-
         async with self._lock:
             self._prune_pending()
-            entry = self._pending.pop(request_id, None)
+            entry = self._pending.get(request_id)
             if entry is None:
                 raise AuthorizeError(
                     "invalid_request",
                     "This approval link has expired or was already used. Start again.",
                 )
-            client_id, params, _ = entry
-            client = await self.get_client(client_id)
+
+            if csrf_token is not None and csrf_token.strip():
+                if not hmac.compare_digest(csrf_token.encode(), entry.csrf_token.encode()):
+                    logger.warning("Rejected consent attempt %s: invalid CSRF token", request_id)
+                    raise AuthorizeError("access_denied", "Invalid anti-CSRF token")
+
+            if not hmac.compare_digest(consent_secret.encode(), self._config.consent_secret.encode()):
+                entry.failed_attempts += 1
+                attempts_left = MAX_CONSENT_ATTEMPTS - entry.failed_attempts
+                if attempts_left <= 0:
+                    self._pending.pop(request_id, None)
+                    logger.warning(
+                        "Consent request %s locked out after %d failed attempts",
+                        request_id,
+                        MAX_CONSENT_ATTEMPTS,
+                    )
+                    raise AuthorizeError(
+                        "access_denied",
+                        "Too many failed attempts. Approval link invalidated.",
+                    )
+                logger.warning(
+                    "Rejected consent attempt %s: wrong secret (%d attempts remaining)",
+                    request_id,
+                    attempts_left,
+                )
+                raise AuthorizeError(
+                    "access_denied",
+                    f"Incorrect approval secret ({attempts_left} attempts remaining)",
+                )
+
+            self._pending.pop(request_id, None)
+            client = await self.get_client(entry.client_id)
             if client is None:
                 raise AuthorizeError("unauthorized_client", "The client is no longer registered")
 
             code = secrets.token_urlsafe(32)
             self._codes[code] = AuthorizationCode(
                 code=code,
-                scopes=params.scopes or [],
+                scopes=entry.params.scopes or [],
                 expires_at=time.time() + AUTHORIZATION_CODE_TTL_SECONDS,
                 client_id=client.client_id,
-                code_challenge=params.code_challenge,
-                redirect_uri=params.redirect_uri,
-                redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
-                resource=params.resource,
+                code_challenge=entry.params.code_challenge,
+                redirect_uri=entry.params.redirect_uri,
+                redirect_uri_provided_explicitly=entry.params.redirect_uri_provided_explicitly,
+                resource=entry.params.resource,
                 subject=self._config.subject,
             )
             self._persist()
@@ -668,13 +726,11 @@ class XSearchOAuthProvider(
         logger.info("Approved authorization request %s for client %s", request_id, client.client_id)
 
         # RFC 9207: include `iss` so a client can tell which authorization server
-        # answered and refuse a response that came from somewhere else. It must be
-        # byte-identical to the issuer advertised in our metadata, hence the
-        # round-trip through AnyHttpUrl (which normalises a bare origin).
+        # answered and refuse a response that came from somewhere else.
         return construct_redirect_uri(
-            str(params.redirect_uri),
+            str(entry.params.redirect_uri),
             code=code,
-            state=params.state,
+            state=entry.params.state,
             iss=str(AnyHttpUrl(self._config.issuer_url)),
         )
 
@@ -698,16 +754,7 @@ class XSearchOAuthProvider(
         client: OAuthClientInformationFull,
         authorization_code: AuthorizationCode,
     ) -> OAuthToken:
-        """Redeem an authorization code for an access token, exactly once.
-
-        The pop IS the single-use gate. Previously the result was discarded and
-        tokens were issued unconditionally, which was only safe because no await sat
-        between loading the code and exchanging it — an accidental property, not an
-        enforced one. Any added await or retry would have double-minted tokens.
-
-        Raises:
-            TokenError: If the code was already redeemed.
-        """
+        """Redeem an authorization code for an access token, exactly once."""
         async with self._lock:
             if self._codes.pop(authorization_code.code, None) is None:
                 logger.warning(
@@ -727,9 +774,6 @@ class XSearchOAuthProvider(
         resource: str | None = None,
     ) -> OAuthToken:
         now = int(time.time())
-        # Bind the token to our own resource URL when the client did not ask for a
-        # specific one (RFC 8707). AuthSettings.validate_token_resource is on, so a
-        # token with no resource would be refused at the MCP endpoint.
         resource = resource or self._config.issuer_url
         access = AccessToken(
             token=secrets.token_urlsafe(40),
@@ -765,12 +809,7 @@ class XSearchOAuthProvider(
         client: OAuthClientInformationFull,
         refresh_token: str,
     ) -> RefreshToken | None:
-        """Load a refresh token belonging to this client.
-
-        Also accepts a token that was rotated out within the last
-        :data:`REFRESH_REUSE_GRACE_SECONDS`, so a client whose two connections
-        refresh at the same instant does not get one of them rejected.
-        """
+        """Load a refresh token belonging to this client."""
         token = self._refresh_tokens.get(refresh_token)
         if token is None:
             rotated = self._rotated_refresh.get(refresh_token)
@@ -790,12 +829,7 @@ class XSearchOAuthProvider(
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        """Rotate a refresh token, narrowing scopes if the client asked for less.
-
-        The rotated-out token stays usable for a short grace window rather than
-        being revoked instantly: with two live connections, an instant revoke makes
-        the second concurrent refresh fail even though it is legitimate.
-        """
+        """Rotate a refresh token, narrowing scopes if the client asked for less."""
         async with self._lock:
             still_current = self._refresh_tokens.pop(refresh_token.token, None)
             if still_current is not None:

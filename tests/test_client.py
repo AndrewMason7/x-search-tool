@@ -611,3 +611,52 @@ async def test_search_recent_unicode_and_emojis(sample_search_json: dict[str, An
         res = await client.search_recent(query="🚀 #AI 日本語 🐍")
         assert len(res.posts) == 2
         assert "%F0%9F%9A%80" in captured_query or "🚀" in captured_query
+
+
+@pytest.mark.asyncio
+async def test_retry_on_read_and_write_errors(sample_single_post_json: dict[str, Any]):
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadError("Connection reset by peer", request=request)
+        if calls == 2:
+            raise httpx.WriteError("Broken pipe", request=request)
+        return httpx.Response(200, json=sample_single_post_json)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = XClient(
+            bearer_token="test_token",
+            http_client=http_client,
+            max_retries=3,
+            backoff_base=0.0001,
+        )
+        post = await client.get_post("1840000000000000001")
+        assert calls == 3
+        assert post.id == "1840000000000000001"
+
+
+def test_calculate_backoff_jitter():
+    client = XClient(bearer_token="test_token", backoff_base=1.0)
+    # retry-after has positive jitter added when > 0
+    val_after = client._calculate_backoff(1, retry_after=5.5)
+    assert 5.5 <= val_after <= 6.0
+
+    # retry_after == 0 has 0 jitter
+    assert client._calculate_backoff(1, retry_after=0.0) == 0.0
+
+    # Full jitter ensures 0.0 <= backoff <= ceiling
+    # attempt 1: cap = min(30.0, 1.0 * 2^1) = 2.0
+    for _ in range(20):
+        val = client._calculate_backoff(1)
+        assert 0.01 <= val <= 2.0
+
+    # attempt 3: cap = min(30.0, 1.0 * 2^3) = 8.0
+    for _ in range(20):
+        val = client._calculate_backoff(3)
+        assert 0.01 <= val <= 8.0
+
+
