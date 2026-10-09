@@ -274,4 +274,3 @@ async def test_asgi_app_lifespan_cleans_up(mcp: MCPServer) -> None:
         assert response.status_code == 200
 
     mock_provider.aclose.assert_awaited_once()
-

@@ -1098,6 +1098,3 @@ async def test_oauth_provider_aclose_drains_tasks(provider: XSearchOAuthProvider
     assert len(provider._background_tasks) >= 0
     await provider.aclose()
     assert len(provider._background_tasks) == 0
-
-
-

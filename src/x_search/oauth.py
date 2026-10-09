@@ -680,7 +680,9 @@ class XSearchOAuthProvider(
                     logger.warning("Rejected consent attempt %s: invalid CSRF token", request_id)
                     raise AuthorizeError("access_denied", "Invalid anti-CSRF token")
 
-            if not hmac.compare_digest(consent_secret.encode(), self._config.consent_secret.encode()):
+            if not hmac.compare_digest(
+                consent_secret.encode(), self._config.consent_secret.encode()
+            ):
                 entry.failed_attempts += 1
                 attempts_left = MAX_CONSENT_ATTEMPTS - entry.failed_attempts
                 if attempts_left <= 0:
@@ -916,6 +918,8 @@ def authorization_server_metadata(settings: AuthSettings) -> dict[str, Any]:
         "code_challenge_methods_supported": ["S256"],
         # Public client: PKCE protects the code, no shared secret exists.
         "token_endpoint_auth_methods_supported": ["none"],
+        "logo_uri": "https://t0.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=https://x.com&size=128",
+        "service_documentation": f"{base}/",
     }
 
     registration = settings.client_registration_options

@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
+from mcp.types import Icon
 
 from x_search.client import (
     XAPIAuthError,
@@ -98,9 +99,21 @@ def _build_server() -> MCPServer[Any]:
         oauth_config.store_path,
         "on" if oauth_config.registration_enabled else "off",
     )
+    public_url = oauth_config.issuer_url.rstrip("/")
+    official_icon_url = "https://t0.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=https://x.com&size=128"
+    icons = [
+        Icon(
+            src=official_icon_url,
+            mime_type="image/png",
+            sizes=["128x128"],
+        )
+    ]
     return MCPServer(
         "x-search",
+        title="X Search",
         description="X (Twitter) recent search, full-archive search, post lookup, and rate limit suite",
+        website_url=public_url,
+        icons=icons,
         lifespan=server_lifespan,
         auth=build_auth_settings(oauth_config),
         auth_server_provider=provider,

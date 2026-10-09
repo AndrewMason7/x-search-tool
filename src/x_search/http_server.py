@@ -329,10 +329,11 @@ def _consent_endpoints(provider: Any) -> tuple[Any, Any]:
                 issuer_parsed = urlparse(issuer_url)
                 origin_host = (parsed_origin.hostname or "").lower()
                 issuer_host = (issuer_parsed.hostname or "").lower()
-                is_loopback = (
-                    origin_host in {"localhost", "127.0.0.1", "::1"}
-                    and issuer_host in {"localhost", "127.0.0.1", "::1"}
-                )
+                is_loopback = origin_host in {"localhost", "127.0.0.1", "::1"} and issuer_host in {
+                    "localhost",
+                    "127.0.0.1",
+                    "::1",
+                }
                 if (
                     parsed_origin.scheme != issuer_parsed.scheme
                     or parsed_origin.netloc != issuer_parsed.netloc

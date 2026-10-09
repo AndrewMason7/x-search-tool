@@ -658,5 +658,3 @@ def test_calculate_backoff_jitter():
     for _ in range(20):
         val = client._calculate_backoff(3)
         assert 0.01 <= val <= 8.0
-
-
