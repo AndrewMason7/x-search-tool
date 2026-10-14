@@ -16,7 +16,7 @@ An asynchronous Model Context Protocol (MCP) server and Antigravity plugin for s
 - **Hydrated Data:** Automatic resolution of author handles, verified badges, profile pictures, and engagement metrics (likes, reposts, replies, views).
 - **Post Lookup:** Fetch single posts using either numeric status IDs or full URLs (`https://x.com/...` or `https://twitter.com/...`).
 - **Rate Limit Tracking:** Real-time quota tracking (`x-rate-limit-remaining`, `x-rate-limit-reset`) with actionable countdowns and per-endpoint isolation.
-- **FastMCP & stdio:** Built on the official Python MCP SDK with stdio transport.
+- **Official MCP SDK, stdio by default:** Runs over stdin/stdout for local hosts, with optional Streamable-HTTP and SSE transports for remote/web clients (Google Gemini Spark, hosted agents).
 - **Agent Skill & Antigravity Plugin:** Bundled with `plugin.json`, `mcp_config.json`, and `skills/x-search/SKILL.md` for seamless agent workflows.
 
 ---
@@ -104,6 +104,162 @@ Add the following entry to your MCP configuration:
   }
 }
 ```
+
+---
+
+## Remote / Network Deployment (Streamable-HTTP + SSE)
+
+Local hosts launch this server over **stdio**, which is the default and needs no
+configuration. Remote clients cannot spawn a subprocess: they need a public HTTPS
+endpoint speaking JSON-RPC over POST (Streamable-HTTP) or Server-Sent Events.
+
+```bash
+# Streamable-HTTP + SSE on one port, no auth (put a reverse proxy in front)
+x-search --transport both --host 127.0.0.1 --port 8091
+
+# Same, but every request must carry a bearer token
+X_SEARCH_HTTP_TOKEN="$(openssl rand -hex 32)" \
+  x-search --transport both --host 127.0.0.1 --port 8091
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /mcp` | Streamable-HTTP JSON-RPC (the modern transport) |
+| `GET /sse`, `POST /messages/` | Legacy HTTP+SSE transport |
+| `GET /health` | Liveness probe, always unauthenticated |
+| `GET /.well-known/oauth-protected-resource` | RFC 9728 probe, answered with `{}` so clients stop probing |
+
+### Options
+
+| Flag | Env var | Default | Notes |
+|---|---|---|---|
+| `--transport` | `X_SEARCH_TRANSPORT` | `stdio` | `stdio`, `sse`, `streamable-http`, or `both` |
+| `--host` | `X_SEARCH_HOST` | `127.0.0.1` | Bind address for network transports |
+| `--port` | `X_SEARCH_PORT` | `8091` | Bind port for network transports |
+| `--path` | `X_SEARCH_PATH` | `/mcp` | Streamable-HTTP endpoint path |
+| `--stateless` | `X_SEARCH_STATELESS` | off | Omit `Mcp-Session-Id`; friendlier behind a proxy |
+| `--bearer-token` | `X_SEARCH_HTTP_TOKEN` | unset | Requires a static `Authorization: Bearer` token on every request; an explicitly empty value is rejected rather than silently disabling auth. Incompatible with the OAuth layer below |
+
+### Connecting Google Gemini Spark
+
+Gemini Spark's custom connected apps are **OAuth-only**. When you paste an MCP
+server URL it performs protected-resource discovery (RFC 9728), then
+authorization-server discovery (RFC 8414), then an authorization-code flow with
+PKCE. A server that answers "no authorization server here" is rejected with
+*"This URL does not appear to be a valid MCP server"* — even when its JSON-RPC
+endpoint is perfectly healthy.
+
+Setting `X_SEARCH_PUBLIC_URL` makes this server its own OAuth 2.1 authorization
+server:
+
+```bash
+X_SEARCH_PUBLIC_URL="https://mcp.example.com" \
+X_SEARCH_OAUTH_STORE="$HOME/.config/xsearch-oauth.json" \
+  x-search --transport both --host 127.0.0.1 --port 8091
+```
+
+On first start it generates a client ID and secret and persists them. Spark does
+**not** need them: it registers itself.
+
+Then, in **Settings & help → Connected Apps → Custom apps for Spark → Add a
+custom app**, enter the MCP server URL and click **Next**:
+
+```
+https://mcp.example.com/mcp
+```
+
+**Leave "Advanced features" collapsed.** That manual-credentials path is only for
+servers without Dynamic Client Registration; this server advertises
+`registration_endpoint`, so Spark registers itself.
+
+#### Why the two metadata fields matter
+
+Two fields in `/.well-known/oauth-authorization-server` decide whether Spark
+accepts the server at all:
+
+| Field | Required value | What happens otherwise |
+|---|---|---|
+| `token_endpoint_auth_methods_supported` | must include `"none"` | Spark is a **public** client. Advertise only `client_secret_post` / `client_secret_basic` and it refuses with *"This MCP server uses an authentication method that Gemini doesn't support."* |
+| `registration_endpoint` | present | Without it Spark cannot self-register and falls back to asking for a client ID and secret |
+
+The MCP SDK hardcodes the first field to the two secret-based methods, so
+`x_search.http_server` **shadows** the SDK's metadata route with its own document
+(`x_search.oauth.authorization_server_metadata`).
+
+#### What keeps open registration safe
+
+Registration is open to anyone, so the redirect URI is the first gate.
+Registrations are only accepted from Google-owned origins — the suffix match
+covers `oauth-redirect.googleusercontent.com`,
+`oauth-redirect-sandbox.googleusercontent.com` and
+`oauth-redirect-test.googleusercontent.com`, which is where all six of Spark's
+real redirect URIs live (override with
+`X_SEARCH_OAUTH_ALLOWED_REDIRECT_ORIGINS`). Loopback callbacks are refused unless
+`X_SEARCH_OAUTH_ALLOW_LOOPBACK=1`, and an empty allow-list refuses to start rather
+than accepting everything.
+
+**The redirect allow-list is necessary but not sufficient**, and it is a mistake to
+treat it as the security boundary. An authorization code is returned in the
+`Location` header of the authorization response, so a caller that never follows
+the redirect can read the code out of its own HTTP response. Origin gating cannot
+stop that.
+
+The real gate is the **approval step**. `GET /authorize` no longer issues anything:
+it redirects the browser to `/consent`, and a code is only minted when a human
+submits the deployment's approval secret. An anonymous caller can register a
+client and start a flow, but it cannot approve one.
+
+```bash
+# read the generated approval secret
+python -c "import json,pathlib; print(json.loads(pathlib.Path('$HOME/.config/xsearch-oauth.json').read_text())['pre_registered_client']['consent_secret'])"
+```
+
+Override with `X_SEARCH_CONSENT_SECRET`. When Spark connects it opens the approval
+page in a browser; enter the secret there once.
+
+Spark is a public client: real traces show it sending `client_id`, `code`,
+`code_verifier` and `redirect_uri` to `/token` and **no client secret**, even when
+it was given one to paste in. The pre-registered client is therefore public by
+default. Set `X_SEARCH_OAUTH_TOKEN_AUTH_METHOD=client_secret_post` (or
+`client_secret_basic`) only if you need a genuinely confidential client.
+
+Refresh tokens rotate, but a rotated-out token stays valid for
+`REFRESH_REUSE_GRACE_SECONDS` (120s) so a client holding two connections does not
+have its second concurrent refresh rejected.
+
+#### Reverse proxy
+
+Serve the whole origin — MCP *and* OAuth — from one host, because the issuer URL
+in the metadata has to be the URL clients actually reach:
+
+```caddy
+:8092 {
+    @root_get { method GET; path / }
+    respond @root_get "x-search MCP endpoint" 200
+
+    @health path /health
+    respond @health "ok" 200
+
+    @post_root { method POST; path / }
+    rewrite @post_root /mcp
+
+    @post_sse { method POST; path /sse }
+    rewrite @post_sse /mcp
+
+    reverse_proxy 127.0.0.1:8091 {
+        header_up Accept "application/json, text/event-stream, */*"
+        flush_interval -1
+    }
+}
+```
+
+Expose port 8092 through a Cloudflare Tunnel to get the HTTPS URL. Two
+operational notes:
+
+- Do **not** front this with a WAF rule that blocks non-browser user agents —
+  MCP clients are servers, not browsers.
+- The generated client secret is the credential. Rotate it by deleting the store
+  file and re-adding the app in Gemini.
 
 ---
 

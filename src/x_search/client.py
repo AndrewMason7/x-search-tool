@@ -62,6 +62,8 @@ _MAX_POST_INPUT_LEN = 512
 _ALLOWED_DOMAINS = {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}
 _ALLOWED_SORT_ORDERS = {"recency", "relevancy"}
 
+DEFAULT_TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0)
+
 
 def extract_post_id(post_id_or_url: str) -> str:
     """Extract numeric post ID from a raw ID or an X/Twitter URL."""
@@ -128,7 +130,7 @@ class XClient:
         self,
         bearer_token: str | None = None,
         http_client: httpx.AsyncClient | None = None,
-        timeout: float = 15.0,
+        timeout: float | httpx.Timeout = DEFAULT_TIMEOUT,
         max_retries: int = 2,
         backoff_base: float = 0.2,
     ) -> None:
@@ -141,7 +143,7 @@ class XClient:
                 "Please configure your X Bearer Token."
             )
         self._bearer_token = token
-        self._timeout = timeout
+        self._timeout = timeout if isinstance(timeout, httpx.Timeout) else httpx.Timeout(timeout)
         self._max_retries = max_retries
         self._backoff_base = backoff_base
         self._rate_limits: dict[str, RateLimitStatus] = {}
@@ -184,15 +186,38 @@ class XClient:
         return self._client_lock
 
     async def _get_http_client(self) -> httpx.AsyncClient:
-        """Returns the shared connection-pooled HTTP client."""
+        """Returns the shared connection-pooled HTTP client, scoped safely to the active loop."""
         if self._external_client:
             return self._external_client
+
+        try:
+            curr_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            curr_loop = None
+
+        if (
+            self._internal_client is not None
+            and not self._internal_client.is_closed
+            and self._lock_loop is not None
+            and self._lock_loop is not curr_loop
+        ):
+            logger.debug("Event loop changed; refreshing internal HTTP client")
+            try:
+                await self._internal_client.aclose()
+            except Exception:
+                pass
+            self._internal_client = None
+
         if self._internal_client is None or self._internal_client.is_closed:
             async with self._get_lock():
                 if self._internal_client is None or self._internal_client.is_closed:
                     self._internal_client = httpx.AsyncClient(
                         timeout=self._timeout,
-                        limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+                        limits=httpx.Limits(
+                            max_keepalive_connections=10,
+                            max_connections=20,
+                            keepalive_expiry=30.0,
+                        ),
                     )
         return self._internal_client
 
@@ -263,6 +288,14 @@ class XClient:
             return float(stripped)
         return None
 
+    def _calculate_backoff(self, attempt: int, retry_after: float | None = None) -> float:
+        """Calculate retry delay with full jitter to avoid thundering herds."""
+        if retry_after is not None:
+            jitter = random.uniform(0.01, 0.5) if retry_after > 0 else 0.0
+            return min(retry_after, 60.0) + jitter
+        ceiling = self._backoff_base * (2**attempt)
+        return random.uniform(0.01, max(0.01, ceiling))
+
     async def _send_request(
         self,
         method: str,
@@ -290,12 +323,7 @@ class XClient:
                 if res.status_code in (500, 502, 503, 504) and attempt < self._max_retries:
                     attempt += 1
                     retry_after = self._extract_retry_after(res.headers)
-                    if retry_after is not None:
-                        sleep_time = min(retry_after, 60.0) + random.uniform(0.01, 0.05)
-                    else:
-                        sleep_time = (self._backoff_base * (2**attempt)) + random.uniform(
-                            0.01, 0.05
-                        )
+                    sleep_time = self._calculate_backoff(attempt, retry_after)
                     logger.warning(
                         "Transient HTTP %d from X API; retrying in %.2fs (attempt %d/%d)",
                         res.status_code,
@@ -308,10 +336,15 @@ class XClient:
 
                 return self._handle_response(res, endpoint_key=endpoint_key)
 
-            except (httpx.ConnectError, httpx.TimeoutException, httpx.ProtocolError) as e:
+            except (
+                httpx.ConnectError,
+                httpx.TimeoutException,
+                httpx.ProtocolError,
+                httpx.TransportError,
+            ) as e:
                 if attempt < self._max_retries:
                     attempt += 1
-                    sleep_time = (self._backoff_base * (2**attempt)) + random.uniform(0.01, 0.05)
+                    sleep_time = self._calculate_backoff(attempt)
                     logger.warning(
                         "Transient network error (%s); retrying in %.2fs (attempt %d/%d)",
                         type(e).__name__,
