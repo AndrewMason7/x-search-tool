@@ -1098,3 +1098,41 @@ async def test_oauth_provider_aclose_drains_tasks(provider: XSearchOAuthProvider
     assert len(provider._background_tasks) >= 0
     await provider.aclose()
     assert len(provider._background_tasks) == 0
+
+
+def test_api_key_works_alongside_oauth(
+    oauth_config: OAuthConfig,
+    provider: XSearchOAuthProvider,
+) -> None:
+    """An API key authenticates even when OAuth 2.1 is fully configured on the server."""
+    server = MCPServer("x-search", lifespan=server_lifespan)
+    server.settings.auth = build_auth_settings(oauth_config)
+    server._auth_server_provider = provider
+    server._token_verifier = provider
+
+    app = build_asgi_app(
+        server,
+        stateless_http=True,
+        oauth_provider=provider,
+        api_keys=["my-oauth-api-key"],
+    )
+
+    with TestClient(app) as client:
+        # Valid API key succeeds
+        res = client.post(
+            "/mcp",
+            json=INITIALIZE,
+            headers={
+                "X-API-Key": "my-oauth-api-key",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+        assert res.status_code == 200
+
+        # Invalid API key rejected with OAuth challenge
+        res_bad = client.post(
+            "/mcp",
+            json=INITIALIZE,
+            headers={"X-API-Key": "wrong-key", "Accept": "application/json, text/event-stream"},
+        )
+        assert res_bad.status_code == 401

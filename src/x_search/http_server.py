@@ -37,10 +37,14 @@ from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from mcp.server.auth.provider import AuthorizeError
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.server.auth.provider import AccessToken, AuthorizeError
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
+from starlette.authentication import AuthCredentials, AuthenticationBackend, SimpleUser
+from starlette.middleware import Middleware
+from starlette.requests import HTTPConnection
 from starlette.responses import (
     HTMLResponse,
     JSONResponse,
@@ -187,6 +191,56 @@ class BearerAuthMiddleware(ApiKeyAuthMiddleware):
             raise ValueError("BearerAuthMiddleware requires a non-empty token")
         super().__init__(app, api_keys=[token], exempt_paths=exempt_paths)
         self._expected = f"Bearer {token}".encode()
+
+
+class ApiKeyAndBearerAuthBackend(AuthenticationBackend):
+    """Authentication backend that accepts configured API keys and falls back to Bearer tokens."""
+
+    def __init__(
+        self,
+        inner_backend: AuthenticationBackend | None,
+        valid_keys: tuple[bytes, ...],
+        scopes: list[str],
+    ) -> None:
+        self.inner_backend = inner_backend
+        self._valid_keys = valid_keys
+        self._scopes = scopes
+
+    async def authenticate(self, conn: HTTPConnection) -> tuple[AuthCredentials, SimpleUser] | None:
+        candidates: list[bytes] = []
+
+        # 1. X-API-Key header
+        x_api_key = conn.headers.get("x-api-key")
+        if x_api_key:
+            candidates.append(x_api_key.strip().encode("utf-8"))
+
+        # 2. Authorization header (Bearer / Api-Key / ApiKey)
+        auth = conn.headers.get("authorization")
+        if auth:
+            parts = auth.split(" ", 1)
+            if len(parts) == 2 and parts[0].lower() in ("bearer", "api-key", "apikey"):
+                candidates.append(parts[1].strip().encode("utf-8"))
+
+        # 3. Query params (?api_key=...)
+        if conn.query_params:
+            for param in ("api_key", "apiKey", "key"):
+                val = conn.query_params.get(param)
+                if val and val.strip():
+                    candidates.append(val.strip().encode("utf-8"))
+
+        for candidate in candidates:
+            for expected in self._valid_keys:
+                if secrets.compare_digest(candidate, expected):
+                    auth_info = AccessToken(
+                        token=candidate.decode("utf-8", errors="replace"),
+                        client_id="api-key",
+                        scopes=self._scopes,
+                    )
+                    return AuthCredentials(self._scopes), AuthenticatedUser(auth_info)
+
+        if self.inner_backend is not None:
+            return await self.inner_backend.authenticate(conn)
+        return None
 
 
 #: OAuth endpoints whose request shape is worth logging when debugging a client
@@ -663,6 +717,29 @@ def build_asgi_app(
         0, Route(HEALTH_PATH, _health_endpoint(mcp.name or "x-search", transports), methods=["GET"])
     )
 
+    if bearer_token is not None and not bearer_token.strip():
+        raise ValueError(
+            "bearer_token was provided but is empty; pass None to disable authentication "
+            "or supply a non-empty token"
+        )
+
+    resolved_keys: list[str] = []
+    if bearer_token:
+        resolved_keys.append(bearer_token.strip())
+
+    if api_keys is not None:
+        if isinstance(api_keys, str):
+            parsed_keys = [k.strip() for k in api_keys.split(",")]
+        else:
+            parsed_keys = [k.strip() if isinstance(k, str) else "" for k in api_keys]
+        non_empty = [k for k in parsed_keys if k]
+        if not non_empty:
+            raise ValueError(
+                "api_keys was provided but is empty; pass None to disable authentication "
+                "or supply at least one non-empty key"
+            )
+        resolved_keys.extend(non_empty)
+
     # The sub-apps carry app-level middleware that must survive the merge. With
     # OAuth enabled that is Starlette's AuthenticationMiddleware (which is what
     # populates request.auth for the SDK's RequireAuthMiddleware) plus the auth
@@ -679,6 +756,14 @@ def build_asgi_app(
             if key in seen_middleware:
                 continue
             seen_middleware.add(key)
+            if key == "AuthenticationMiddleware" and resolved_keys:
+                original_backend = entry.kwargs.get("backend")
+                scopes = getattr(auth_settings, "required_scopes", None) or ["read", "write"]
+                clean_bytes = tuple(k.encode("utf-8") for k in resolved_keys)
+                entry = Middleware(
+                    entry.cls,
+                    backend=ApiKeyAndBearerAuthBackend(original_backend, clean_bytes, scopes),
+                )
             middleware.append(entry)
 
     # The streamable app owns the only lifespan that matters: it starts and stops
@@ -717,32 +802,9 @@ def build_asgi_app(
                 except Exception:
                     logger.warning("Error draining OAuth provider on shutdown", exc_info=True)
 
-    if bearer_token is not None and not bearer_token.strip():
-        raise ValueError(
-            "bearer_token was provided but is empty; pass None to disable authentication "
-            "or supply a non-empty token"
-        )
-
-    resolved_keys: list[str] = []
-    if bearer_token:
-        resolved_keys.append(bearer_token.strip())
-
-    if api_keys is not None:
-        if isinstance(api_keys, str):
-            parsed_keys = [k.strip() for k in api_keys.split(",")]
-        else:
-            parsed_keys = [k.strip() if isinstance(k, str) else "" for k in api_keys]
-        non_empty = [k for k in parsed_keys if k]
-        if not non_empty:
-            raise ValueError(
-                "api_keys was provided but is empty; pass None to disable authentication "
-                "or supply at least one non-empty key"
-            )
-        resolved_keys.extend(non_empty)
-
     app: ASGIApp = Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
 
-    if resolved_keys:
+    if resolved_keys and not auth_configured:
         app = ApiKeyAuthMiddleware(app, resolved_keys)
 
     if _env_flag("X_SEARCH_DEBUG_AUTH"):
