@@ -83,11 +83,13 @@ OAUTH_METADATA_PREFIX = "/.well-known/oauth-protected-resource"
 _HEADER_LOOKUP_KEY = b"authorization"
 _X_API_KEY_HEADER = b"x-api-key"
 
+
 def _header_value(scope: Scope, name: bytes) -> bytes | None:
     for key, value in scope.get("headers", []):
         if key.lower() == name:
             return value
     return None
+
 
 class ApiKeyAuthMiddleware:
     """Require an API key or bearer token on every request (Pure ASGI)."""
@@ -179,6 +181,7 @@ from mcp.server.auth.provider import AccessToken
 from starlette.authentication import AuthCredentials, AuthenticationBackend, SimpleUser
 from starlette.requests import HTTPConnection
 
+
 class ApiKeyAndBearerAuthBackend(AuthenticationBackend):
     """Authentication backend accepting API keys with fallback to OAuth Bearer tokens."""
 
@@ -192,9 +195,7 @@ class ApiKeyAndBearerAuthBackend(AuthenticationBackend):
         self._valid_keys = valid_keys
         self._scopes = scopes
 
-    async def authenticate(
-        self, conn: HTTPConnection
-    ) -> tuple[AuthCredentials, SimpleUser] | None:
+    async def authenticate(self, conn: HTTPConnection) -> tuple[AuthCredentials, SimpleUser] | None:
         candidates: list[bytes] = []
 
         # 1. Header: X-API-Key
@@ -244,6 +245,7 @@ In your ASGI application builder:
 ```python
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
+
 
 def build_asgi_app(
     mcp: MCPServer,
