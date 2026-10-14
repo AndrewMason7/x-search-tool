@@ -65,6 +65,7 @@ DEFAULT_SSE_PATH = "/sse"
 DEFAULT_MESSAGE_PATH = "/messages/"
 
 _HEADER_LOOKUP_KEY = b"authorization"
+_X_API_KEY_HEADER = b"x-api-key"
 
 
 def _header_value(scope: Scope, name: bytes) -> bytes | None:
@@ -80,8 +81,13 @@ def _env_flag(name: str) -> bool:
     return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-class BearerAuthMiddleware:
-    """Require ``Authorization: Bearer <token>`` on every request.
+class ApiKeyAuthMiddleware:
+    """Require an API key or bearer token on every request.
+
+    Checks credentials in:
+    1. ``X-API-Key`` header
+    2. ``Authorization`` header (with ``Bearer``, ``Api-Key``, or ``ApiKey`` scheme)
+    3. ``api_key`` query parameter (useful for SSE EventSource clients)
 
     Pure ASGI middleware rather than a Starlette ``BaseHTTPMiddleware`` so that
     streaming SSE responses are never buffered. The health probe and the OAuth
@@ -92,13 +98,20 @@ class BearerAuthMiddleware:
     def __init__(
         self,
         app: ASGIApp,
-        token: str,
+        api_keys: Iterable[str] | str,
         exempt_paths: Iterable[str] = (HEALTH_PATH,),
     ) -> None:
-        if not token:
-            raise ValueError("BearerAuthMiddleware requires a non-empty token")
+        if isinstance(api_keys, str):
+            raw_keys = [k.strip() for k in api_keys.split(",")]
+        else:
+            raw_keys = [k.strip() if isinstance(k, str) else "" for k in api_keys]
+
+        clean_keys = [k.encode("utf-8") for k in raw_keys if k]
+        if not clean_keys:
+            raise ValueError("ApiKeyAuthMiddleware requires at least one non-empty API key")
+
         self.app = app
-        self._expected = f"Bearer {token}".encode()
+        self._valid_keys = tuple(clean_keys)
         self._exempt = frozenset(exempt_paths)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -111,8 +124,41 @@ class BearerAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        supplied = _header_value(scope, _HEADER_LOOKUP_KEY)
-        if supplied is None or not secrets.compare_digest(supplied, self._expected):
+        candidates: list[bytes] = []
+
+        # 1. X-API-Key header
+        x_api_key = _header_value(scope, _X_API_KEY_HEADER)
+        if x_api_key is not None:
+            candidates.append(x_api_key.strip())
+
+        # 2. Authorization header (Bearer / Api-Key / ApiKey)
+        auth = _header_value(scope, _HEADER_LOOKUP_KEY)
+        if auth is not None:
+            parts = auth.split(b" ", 1)
+            if len(parts) == 2:
+                scheme = parts[0].lower()
+                if scheme in (b"bearer", b"api-key", b"apikey"):
+                    candidates.append(parts[1].strip())
+
+        # 3. Query string (?api_key=...)
+        query_string = scope.get("query_string", b"")
+        if query_string:
+            query_params = parse_qs(query_string.decode("latin1", errors="replace"))
+            for param in ("api_key", "apiKey", "key"):
+                vals = query_params.get(param)
+                if vals and vals[0].strip():
+                    candidates.append(vals[0].strip().encode("utf-8"))
+
+        authenticated = False
+        for candidate in candidates:
+            for expected in self._valid_keys:
+                if secrets.compare_digest(candidate, expected):
+                    authenticated = True
+                    break
+            if authenticated:
+                break
+
+        if not authenticated:
             logger.warning("Rejected unauthenticated request: %s %s", scope.get("method"), path)
             response = PlainTextResponse(
                 "Unauthorized\n",
@@ -123,6 +169,24 @@ class BearerAuthMiddleware:
             return
 
         await self.app(scope, receive, send)
+
+
+class BearerAuthMiddleware(ApiKeyAuthMiddleware):
+    """Require ``Authorization: Bearer <token>`` on every request.
+
+    Subclasses ``ApiKeyAuthMiddleware`` for backward compatibility.
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        token: str,
+        exempt_paths: Iterable[str] = (HEALTH_PATH,),
+    ) -> None:
+        if not token or not token.strip():
+            raise ValueError("BearerAuthMiddleware requires a non-empty token")
+        super().__init__(app, api_keys=[token], exempt_paths=exempt_paths)
+        self._expected = f"Bearer {token}".encode()
 
 
 #: OAuth endpoints whose request shape is worth logging when debugging a client
@@ -451,6 +515,7 @@ def build_asgi_app(
     message_path: str = DEFAULT_MESSAGE_PATH,
     stateless_http: bool = False,
     bearer_token: str | None = None,
+    api_keys: Iterable[str] | str | None = None,
     host: str = DEFAULT_HOST,
     oauth_provider: Any | None = None,
 ) -> ASGIApp:
@@ -467,6 +532,10 @@ def build_asgi_app(
             ``Mcp-Session-Id``. Recommended behind a reverse proxy.
         bearer_token: When set, require this static bearer token on all requests
             except ``/health`` and the OAuth resource-metadata probe.
+        api_keys: When set, require an API key on all requests except ``/health``.
+            Can be passed as an iterable of strings or a comma-separated string.
+            Credentials are accepted in ``X-API-Key``, ``Authorization: Bearer <key>``,
+            ``Authorization: Api-Key <key>``, or ``?api_key=<key>``.
         host: Origin host used for the transport-security policy. The public
             hostname differs (it is the tunnel's), so DNS-rebinding protection is
             disabled and left to the proxy layer.
@@ -532,6 +601,7 @@ def build_asgi_app(
             ),
         )
     else:
+        assert auth_settings is not None
         # Shadow the SDK's authorization-server metadata document. Its version
         # advertises only the secret-based token endpoint auth methods, and Spark
         # is a public client — it rejects the server outright with "uses an
@@ -653,10 +723,27 @@ def build_asgi_app(
             "or supply a non-empty token"
         )
 
+    resolved_keys: list[str] = []
+    if bearer_token:
+        resolved_keys.append(bearer_token.strip())
+
+    if api_keys is not None:
+        if isinstance(api_keys, str):
+            parsed_keys = [k.strip() for k in api_keys.split(",")]
+        else:
+            parsed_keys = [k.strip() if isinstance(k, str) else "" for k in api_keys]
+        non_empty = [k for k in parsed_keys if k]
+        if not non_empty:
+            raise ValueError(
+                "api_keys was provided but is empty; pass None to disable authentication "
+                "or supply at least one non-empty key"
+            )
+        resolved_keys.extend(non_empty)
+
     app: ASGIApp = Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
 
-    if bearer_token:
-        app = BearerAuthMiddleware(app, bearer_token)
+    if resolved_keys:
+        app = ApiKeyAuthMiddleware(app, resolved_keys)
 
     if _env_flag("X_SEARCH_DEBUG_AUTH"):
         app = AuthDebugMiddleware(app)
@@ -681,6 +768,7 @@ def run_http_server(
     message_path: str = DEFAULT_MESSAGE_PATH,
     stateless_http: bool = False,
     bearer_token: str | None = None,
+    api_keys: Iterable[str] | str | None = None,
     access_log: bool = False,
     oauth_provider: Any | None = None,
 ) -> None:
@@ -702,17 +790,19 @@ def run_http_server(
         message_path=message_path,
         stateless_http=stateless_http,
         bearer_token=bearer_token,
+        api_keys=api_keys,
         host=host,
         oauth_provider=oauth_provider,
     )
 
+    auth_label = "api_key" if (api_keys or bearer_token) else "none"
     logger.info(
         "Serving x-search MCP over HTTP on http://%s:%d (streamable=%s, sse=%s, auth=%s)",
         host,
         port,
         streamable_http_path if enable_streamable_http else "off",
         sse_path if enable_sse else "off",
-        "bearer" if bearer_token else "none",
+        auth_label,
     )
 
     uvicorn.run(

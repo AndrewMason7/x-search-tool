@@ -101,6 +101,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--api-key",
+        action="append",
+        default=None,
+        help=(
+            "Require an API key on all HTTP requests except /health. "
+            "Accepted via 'X-API-Key' header, 'Authorization: Bearer <key>', "
+            "'Authorization: Api-Key <key>', or '?api_key=<key>' query param. "
+            "Can be specified multiple times or as comma-separated values. "
+            "Defaults to $X_SEARCH_API_KEY; leave unset to disable."
+        ),
+    )
+    parser.add_argument(
         "--access-log",
         action="store_true",
         default=_env_bool("X_SEARCH_ACCESS_LOG"),
@@ -129,6 +141,15 @@ def main() -> None:
         print(f"error: unsupported transport selection {args.transport!r}", file=sys.stderr)
         raise SystemExit(2)
 
+    api_keys: list[str] | None = None
+    if args.api_key is not None:
+        api_keys = []
+        for k in args.api_key:
+            for sub in k.split(","):
+                api_keys.append(sub.strip())
+    elif os.getenv("X_SEARCH_API_KEY") is not None:
+        api_keys = [sub.strip() for sub in os.environ["X_SEARCH_API_KEY"].split(",")]
+
     run_http_server(
         mcp,
         host=args.host,
@@ -140,6 +161,7 @@ def main() -> None:
         message_path=args.message_path,
         stateless_http=args.stateless,
         bearer_token=args.bearer_token,
+        api_keys=api_keys,
         access_log=args.access_log,
         oauth_provider=oauth_provider,
     )

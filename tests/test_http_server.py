@@ -15,7 +15,12 @@ import pytest
 from mcp.server.mcpserver import MCPServer
 from starlette.testclient import TestClient
 
-from x_search.http_server import HEALTH_PATH, AuthDebugMiddleware, build_asgi_app
+from x_search.http_server import (
+    HEALTH_PATH,
+    ApiKeyAuthMiddleware,
+    AuthDebugMiddleware,
+    build_asgi_app,
+)
 from x_search.server import server_lifespan
 
 
@@ -274,3 +279,171 @@ async def test_asgi_app_lifespan_cleans_up(mcp: MCPServer) -> None:
         assert response.status_code == 200
 
     mock_provider.aclose.assert_awaited_once()
+
+
+def test_empty_api_key_is_rejected(mcp: MCPServer) -> None:
+    """Empty api_keys input must fail loudly instead of disabling auth."""
+    with pytest.raises(ValueError, match="empty"):
+        build_asgi_app(mcp, api_keys=[])
+
+    with pytest.raises(ValueError, match="empty"):
+        build_asgi_app(mcp, api_keys="")
+
+    with pytest.raises(ValueError, match="empty"):
+        build_asgi_app(mcp, api_keys=["   ", ""])
+
+
+def test_api_key_via_x_api_key_header(mcp: MCPServer) -> None:
+    """X-API-Key header authenticates when valid and rejects when invalid."""
+    app = build_asgi_app(mcp, stateless_http=True, api_keys=["secret-123"])
+    with TestClient(app) as client:
+        # Valid key
+        res = client.post(
+            "/mcp",
+            json=INITIALIZE,
+            headers={**JSON_HEADERS, "X-API-Key": "secret-123"},
+        )
+        assert res.status_code == 200
+
+        # Invalid key
+        res_bad = client.post(
+            "/mcp",
+            json=INITIALIZE,
+            headers={**JSON_HEADERS, "X-API-Key": "wrong-key"},
+        )
+        assert res_bad.status_code == 401
+        assert res_bad.headers["www-authenticate"].startswith("Bearer")
+
+
+def test_api_key_via_authorization_header(mcp: MCPServer) -> None:
+    """Authorization header supports Bearer, Api-Key, and ApiKey prefixes."""
+    app = build_asgi_app(mcp, stateless_http=True, api_keys=["secret-123"])
+    with TestClient(app) as client:
+        for prefix in ("Bearer", "Api-Key", "ApiKey", "bearer", "api-key"):
+            res = client.post(
+                "/mcp",
+                json=INITIALIZE,
+                headers={**JSON_HEADERS, "Authorization": f"{prefix} secret-123"},
+            )
+            assert res.status_code == 200, f"Failed for prefix: {prefix}"
+
+        res_bad = client.post(
+            "/mcp",
+            json=INITIALIZE,
+            headers={**JSON_HEADERS, "Authorization": "Bearer wrong-key"},
+        )
+        assert res_bad.status_code == 401
+
+
+def test_api_key_via_query_parameter(mcp: MCPServer) -> None:
+    """Query parameter ?api_key=<key> authenticates without headers."""
+    app = build_asgi_app(mcp, stateless_http=True, api_keys=["secret-123"])
+    with TestClient(app) as client:
+        res = client.post("/mcp?api_key=secret-123", json=INITIALIZE, headers=JSON_HEADERS)
+        assert res.status_code == 200
+
+        res_bad = client.post("/mcp?api_key=wrong-key", json=INITIALIZE, headers=JSON_HEADERS)
+        assert res_bad.status_code == 401
+
+
+def test_api_key_multiple_keys_supported(mcp: MCPServer) -> None:
+    """Multiple API keys can be passed as a list, and any of them authenticate."""
+    app = build_asgi_app(mcp, stateless_http=True, api_keys=["key-a", "key-b"])
+    with TestClient(app) as client:
+        assert (
+            client.post(
+                "/mcp", json=INITIALIZE, headers={**JSON_HEADERS, "X-API-Key": "key-a"}
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/mcp", json=INITIALIZE, headers={**JSON_HEADERS, "X-API-Key": "key-b"}
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/mcp", json=INITIALIZE, headers={**JSON_HEADERS, "X-API-Key": "key-c"}
+            ).status_code
+            == 401
+        )
+
+
+def test_api_key_comma_separated_string(mcp: MCPServer) -> None:
+    """A comma-separated string of API keys is parsed into distinct keys."""
+    app = build_asgi_app(mcp, stateless_http=True, api_keys="key-1, key-2")
+    with TestClient(app) as client:
+        assert (
+            client.post(
+                "/mcp", json=INITIALIZE, headers={**JSON_HEADERS, "X-API-Key": "key-1"}
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/mcp", json=INITIALIZE, headers={**JSON_HEADERS, "X-API-Key": "key-2"}
+            ).status_code
+            == 200
+        )
+
+
+def test_api_key_health_and_metadata_remain_public(mcp: MCPServer) -> None:
+    """Public endpoints remain accessible without credentials when api_keys is set."""
+    app = build_asgi_app(mcp, stateless_http=True, api_keys=["secret-123"])
+    with TestClient(app) as client:
+        res_health = client.get(HEALTH_PATH)
+        assert res_health.status_code == 200
+
+        res_meta = client.get("/.well-known/oauth-protected-resource")
+        assert res_meta.status_code == 200
+
+
+def test_api_key_and_bearer_token_coexist(mcp: MCPServer) -> None:
+    """Both bearer_token and api_keys can be supplied together."""
+    app = build_asgi_app(
+        mcp,
+        stateless_http=True,
+        bearer_token="bearer-val",
+        api_keys=["api-val"],
+    )
+    with TestClient(app) as client:
+        assert (
+            client.post(
+                "/mcp",
+                json=INITIALIZE,
+                headers={**JSON_HEADERS, "Authorization": "Bearer bearer-val"},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/mcp", json=INITIALIZE, headers={**JSON_HEADERS, "X-API-Key": "api-val"}
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/mcp", json=INITIALIZE, headers={**JSON_HEADERS, "X-API-Key": "unknown"}
+            ).status_code
+            == 401
+        )
+
+
+def test_cli_api_key_parsing() -> None:
+    """CLI parser collects multiple --api-key flags and preserves comma-separated lists."""
+    from x_search.cli import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["--api-key", "key-one", "--api-key", "key-two,key-three"])
+    assert args.api_key == ["key-one", "key-two,key-three"]
+
+
+def test_api_key_auth_middleware_direct() -> None:
+    """Direct instantiation of ApiKeyAuthMiddleware validates keys properly."""
+
+    async def dummy_app(scope: object, receive: object, send: object) -> None:
+        pass
+
+    with pytest.raises(ValueError, match="at least one non-empty API key"):
+        ApiKeyAuthMiddleware(dummy_app, api_keys=[])
