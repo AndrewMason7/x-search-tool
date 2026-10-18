@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
-from mcp.types import Icon
+from mcp.types import Icon, ToolAnnotations
 
 from x_search.client import (
     XAPIAuthError,
@@ -283,7 +283,19 @@ def format_post_counts(res: PostCountsResponse, query: str, full_archive: bool) 
     return "\n".join(out)
 
 
-@mcp.tool()
+READ_ONLY_TOOL_ANNOTATIONS = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=True,
+)
+
+
+@mcp.tool(
+    name="search_recent_posts",
+    title="Search Recent Posts",
+    annotations=READ_ONLY_TOOL_ANNOTATIONS,
+)
 @mcp_error_boundary
 async def search_recent_posts(
     query: str,
@@ -291,7 +303,9 @@ async def search_recent_posts(
     next_token: str | None = None,
     sort_order: str = "recency",
 ) -> str:
-    """Search recent posts (last 7 days) on X (Twitter).
+    """Search recent posts (last 7 days) on X (Twitter) (Read-Only).
+
+    Note: This is a read-only search tool. It does not post, publish, or alter any state.
 
     Supports search operators such as:
     - from:username (posts by user)
@@ -320,10 +334,17 @@ async def search_recent_posts(
     return format_search_response(res, scope_label="recent")
 
 
-@mcp.tool()
+@mcp.tool(
+    name="get_post",
+    title="Get Post Details",
+    annotations=READ_ONLY_TOOL_ANNOTATIONS,
+)
 @mcp_error_boundary
 async def get_post(post_id_or_url: str) -> str:
-    """Fetch details and metrics for a specific post by ID or URL.
+    """Fetch details and metrics for a specific post by ID or URL (Read-Only).
+
+    Note: This is a strictly read-only lookup tool that retrieves existing tweet/post data.
+    It does NOT create, write, publish, or modify any posts or tweets on X.
 
     Args:
         post_id_or_url: A numeric post ID (e.g. '1840000000000000001') or a URL
@@ -334,10 +355,16 @@ async def get_post(post_id_or_url: str) -> str:
     return format_post(post)
 
 
-@mcp.tool()
+@mcp.tool(
+    name="check_rate_limits",
+    title="Check Rate Limits",
+    annotations=READ_ONLY_TOOL_ANNOTATIONS,
+)
 @mcp_error_boundary
 async def check_rate_limits(endpoint: str = "search") -> str:
-    """Check the remaining request quota and reset time for X API endpoints.
+    """Check the remaining request quota and reset time for X API endpoints (Read-Only).
+
+    Note: This is a read-only diagnostics tool that inspects rate limit statuses.
 
     Args:
         endpoint: Endpoint category to inspect: 'search' (recent search), 'search_all' (full archive),
@@ -372,7 +399,11 @@ async def check_rate_limits(endpoint: str = "search") -> str:
     )
 
 
-@mcp.tool()
+@mcp.tool(
+    name="search_full_archive_posts",
+    title="Search Full Archive Posts",
+    annotations=READ_ONLY_TOOL_ANNOTATIONS,
+)
 @mcp_error_boundary(
     auth_help="Full-archive search requires an X developer account tier with archive access (Pro or Academic)."
 )
@@ -384,9 +415,10 @@ async def search_full_archive_posts(
     next_token: str | None = None,
     sort_order: str = "recency",
 ) -> str:
-    """Search the complete historical archive of posts on X (Twitter) from March 2006 to present.
+    """Search the complete historical archive of posts on X (Twitter) from March 2006 to present (Read-Only).
 
-    Note: Requires an X API account tier with full-archive search access.
+    Note: This is a read-only search tool. It does not post, publish, or alter any state.
+    Requires an X API account tier with full-archive search access.
 
     Args:
         query: Search query string (up to 1024 characters). Supports boolean operators.
@@ -408,7 +440,11 @@ async def search_full_archive_posts(
     return format_search_response(res, scope_label="")
 
 
-@mcp.tool()
+@mcp.tool(
+    name="get_post_counts",
+    title="Get Post Volume Counts",
+    annotations=READ_ONLY_TOOL_ANNOTATIONS,
+)
 @mcp_error_boundary
 async def get_post_counts(
     query: str,
@@ -417,7 +453,9 @@ async def get_post_counts(
     end_time: str | None = None,
     full_archive: bool = False,
 ) -> str:
-    """Analyze post volume and trend counts on X without fetching individual posts.
+    """Analyze post volume and trend counts on X without fetching individual posts (Read-Only).
+
+    Note: This is a read-only analytics tool for querying aggregate volume counts.
 
     Args:
         query: Search query to count matching posts.

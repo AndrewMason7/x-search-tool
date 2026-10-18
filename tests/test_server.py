@@ -363,3 +363,19 @@ def test_configure_logging_unknown_level_falls_back_to_info():
         assert pkg.level == logging.INFO
     finally:
         pkg.setLevel(saved_level)
+
+
+@pytest.mark.asyncio
+async def test_tools_registered_with_read_only_annotations():
+    """Verify all exposed MCP tools declare read-only hints to prevent clients treating them as write actions."""
+    from x_search.server import mcp
+
+    tools = await mcp.list_tools()
+    assert len(tools) == 5
+    for tool in tools:
+        assert tool.annotations is not None, f"Tool {tool.name} must declare annotations"
+        assert tool.annotations.read_only_hint is True, f"Tool {tool.name} must be read-only"
+        assert tool.annotations.destructive_hint is False, (
+            f"Tool {tool.name} must not be destructive"
+        )
+        assert tool.annotations.idempotent_hint is True, f"Tool {tool.name} must be idempotent"
